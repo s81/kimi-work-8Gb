@@ -5,6 +5,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-11-08
+
+Windows release: faster loading, prompts and paths in any language, and `setup.bat`.
+Release notes: [`.github/release-notes/v1.2.3.md`](.github/release-notes/v1.2.3.md).
+
 ### Windows
 
 - **Startup and test time: `strtod` in `msvcrt.dll` made JSON parsing quadratic.** It
@@ -461,7 +466,8 @@ First public release.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md).
 
-[Unreleased]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.2...HEAD
+[Unreleased]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.3...HEAD
+[1.2.3]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/s81/kimi-work-8Gb/releases/tag/v1.2.0
