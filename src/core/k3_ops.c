@@ -29,6 +29,7 @@
  */
 #include "k3.h"
 #include "k3_par.h"
+#include "k3_math.h"   /* k3_expf, k3_tanhf: same bits on every platform */
 
 #include <math.h>
 #include <stdio.h>
@@ -103,7 +104,9 @@ void k3_rmsnorm(float *y, const float *x, const float *w, int n, float eps)
 }
 
 /* -------------------------------------------------------------- SiTU-GLU ---- */
-static inline float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
+/* A macro, not a function: TCC inlines nothing, and a call per element costs more than
+ * the arithmetic. Same expression, same bits. The argument must not have side effects. */
+#define sigmoidf_(x) (1.0f / (1.0f + k3_expf(-(x))))
 
 /* See k3.h. Incremented whenever a streamed expert cannot be fetched. */
 long k3_expert_drops = 0;
@@ -117,8 +120,8 @@ void k3_situ_glu(float *y, const float *x, int n, float b1, float b2)
         /* The sigmoid takes the UNCAPPED gate. Feeding it the capped value instead
          * still yields a bounded, plausible function and is WRONG.
          * modeling_kimi_linear.py:79 */
-        const float a = b1 * tanhf(g / b1) * sigmoidf_(g);
-        const float u = b2 * tanhf(up[i] / b2);
+        const float a = b1 * k3_tanhf(g / b1) * sigmoidf_(g);
+        const float u = b2 * k3_tanhf(up[i] / b2);
         y[i] = a * u;
     }
 }
@@ -172,13 +175,13 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
     for (int h = 0; h < H; h++) {
         /* PER HEAD. The checkpoint stores head_dim floats but only the first H are
          * nonzero. Indexing this per channel is a silent, fatal error. */
-        const float a = expf(A_log[h]);
+        const float a = k3_expf(A_log[h]);
         for (int d = 0; d < D; d++) {
             const int i = h * D + d;
             const float u  = a * (z[i] + dt_bias[i]);
             const float gi = lb * sigmoidf_(u);   /* in (lb, 0] */
             g[i] = gi;
-            alpha[i] = expf(gi);                  /* in (e^lb, 1] */
+            alpha[i] = k3_expf(gi);                  /* in (e^lb, 1] */
         }
     }
 }
@@ -500,7 +503,7 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 if (sc[s] > m) m = sc[s];
             }
             double z = 0.0;
-            for (int s = 0; s <= p; s++) { sc[s] = expf(sc[s] - m); z += sc[s]; }
+            for (int s = 0; s <= p; s++) { sc[s] = k3_expf(sc[s] - m); z += sc[s]; }
 
             float *o = acc + (size_t)h * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
@@ -516,7 +519,7 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         if (w->g) {
             k3_mmw(gbuf, x + (size_t)t * E, w->g, w->wdt, E, H * vh);
             for (int i = 0; i < H * vh; i++)
-                acc[i] *= 1.0f / (1.0f + expf(-gbuf[i]));
+                acc[i] *= 1.0f / (1.0f + k3_expf(-gbuf[i]));
         }
         k3_mmw(out + (size_t)t * E, acc, w->o, w->wdt, H * vh, E);
     }
@@ -558,7 +561,7 @@ static void k3_router_scores(void *k3_vctx_, int k3_b_, int k3_e_)
         const float *row = W + (size_t)e * hidden;
         double acc = 0.0;
         for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
-        score[e]  = 1.0f / (1.0f + expf(-(float)acc));
+        score[e]  = 1.0f / (1.0f + k3_expf(-(float)acc));
         choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
     }
 }
@@ -642,7 +645,7 @@ void k3_attn_res(float *out, const float *src, const float *fold,
     float m = score[0];
     for (int s = 1; s < nsrc; s++) if (score[s] > m) m = score[s];
     double z = 0.0;
-    for (int s = 0; s < nsrc; s++) { score[s] = expf(score[s] - m); z += score[s]; }
+    for (int s = 0; s < nsrc; s++) { score[s] = k3_expf(score[s] - m); z += score[s]; }
 
     for (int i = 0; i < n; i++) out[i] = 0.0f;
     for (int s = 0; s < nsrc; s++) {

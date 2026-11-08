@@ -5,6 +5,44 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-08
+
+Same bits on Windows and Linux: correctly rounded `expf` and `tanhf`.
+Release notes: [`.github/release-notes/v1.3.0.md`](.github/release-notes/v1.3.0.md).
+
+### Changed
+
+- **`expf` and `tanhf` give the same bits on Windows and Linux.** The engine no longer
+  calls the C library for them. `k3_expf` and `k3_tanhf` (`src/core/k3_math.h`) return
+  the correctly rounded float, the one nearest the exact value, in plain C double
+  arithmetic with no libm call. They are used by SiTU-GLU, ShortConv, the KDA decay,
+  the attention softmax, the attention gate and the router. Before this, Windows
+  (`msvcrt.dll`) and Linux (glibc) rounded differently on some inputs, and so did
+  different glibc versions.
+  - **Checked on every input.** `tools/check_math.c` runs both functions on all 2^32
+    floats against glibc's long double `expl` and `tanhl` with a 2^-56 margin: 0
+    failures and 0 cases close enough to need the 300-bit settler
+    (`tools/check_math_exact.py`). A further 5,970 random inputs agree with a 300-bit
+    computation directly. The check found one bug before release, `tanh(-0)` returning
+    +0, now fixed.
+  - **New test, both platforms:** `tests/unit/test_math.c` checks 72 known answers
+    from a 300-bit reference and a digest over 17 million inputs per function.
+  - **Output changes on Linux too, slightly.** glibc 2.39's `tanhf` is not correctly
+    rounded on 118.7 million of the 2^32 inputs (2.8%) and its `expf` on 170,648, so
+    some activations move by one unit in the last place compared with v1.2.3. The
+    reference tests still pass exactly: `test_ops` 22/22 and the full-model oracle.
+  - **Cost, Windows build:** measured back to back on one machine under Wine, best of
+    7, three runs each: ShortConv and the KDA decay are within noise of v1.2.3, and
+    SiTU-GLU is about 1.4x slower (149-189 us to 232-266 us per call), roughly 0.1 s
+    more per token on one thread against 30-40 s for the matrix kernels.
+  - **How it stays cheap under TCC:** a plain double approximation is returned when
+    its error interval cannot straddle a rounding boundary (a bit test on the result),
+    and only the rare remaining inputs take the exact path; a 128-entry table and a
+    degree-4 polynomial in few statements, since TCC keeps values in registers only
+    within one expression; no signed division (TCC emits `idiv`); the sigmoid is a
+    macro, not a call. Per call on Linux: `k3_expf` about 8 ns (glibc 3 ns),
+    `k3_tanhf` about 27 ns (glibc 11 ns).
+
 ## [1.2.3] - 2026-11-08
 
 Windows release: faster loading, prompts and paths in any language, and `setup.bat`.
@@ -466,7 +504,8 @@ First public release.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md).
 
-[Unreleased]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.3...HEAD
+[Unreleased]: https://github.com/s81/kimi-work-8Gb/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.3...v1.3.0
 [1.2.3]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.0...v1.2.1

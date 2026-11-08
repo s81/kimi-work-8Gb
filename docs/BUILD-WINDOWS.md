@@ -48,7 +48,7 @@ checkout on every push.
 Check a download in PowerShell:
 
 ```powershell
-Get-FileHash .\k3-1.2.3-windows-x64.zip -Algorithm SHA256   # compare with SHA256SUMS.txt
+Get-FileHash .\k3-1.3.0-windows-x64.zip -Algorithm SHA256   # compare with SHA256SUMS.txt
 .\k3.exe --help
 ```
 
@@ -107,7 +107,8 @@ on the include path for Windows builds:
 | `strtod` in `msvcrt.dll` | it measures the whole remaining string before parsing, so the JSON parser hands it a copy of each number; parsing in place inside a large document was quadratic |
 | 32-bit `off_t`/`lseek` | `_lseeki64`; offsets are held in `int64_t`, never `off_t` (a cast would wrap past 2 GB) |
 | `clock_gettime`, `mkstemp` | `QueryPerformanceCounter`, an exclusive-create loop |
-| `fma`, `expf`, `sqrtf`, `tanhf` | double-precision equivalents; `fma` is exact only because every call site multiplies float-derived values |
+| `fma`, `sqrtf` | double-precision equivalents; `fma` is exact only because every call site multiplies float-derived values, and `sqrtf` from double is exactly the correctly rounded result |
+| `expf`, `tanhf` | not taken from msvcrt at all: the engine uses its own correctly rounded `k3_expf` and `k3_tanhf` (`src/core/k3_math.h`), so Windows and Linux get the same bits |
 | `GlobalMemoryStatusEx`, `K32GetProcessMemoryInfo`, condition variables, `GetLogicalProcessorInformation` | looked up at run time with `GetProcAddress` |
 | `fabsf`/`fabsl` in TCC's `math.h` | replaced: TCC 0.9.27's header uses x87 assembly TCC cannot compile |
 

@@ -62,6 +62,17 @@ claim. See [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
   contracts `a*b+c`, which keeps the scalar results bit-exact; on Windows `fma()` is
   defined as `a*b+c` (see `src/compat/k3_win32.h`), which is only exact because every
   call site multiplies float-derived values.
+- **No libm transcendentals in the engine.** Use `k3_expf` and `k3_tanhf`
+  (`src/core/k3_math.h`), not `expf`, `tanhf`, `exp` or `tanh`: the C library's
+  versions round differently on Windows, on Linux and between glibc versions. Only
+  `sqrt` is taken from libm, because IEEE 754 requires it to be correctly rounded. If
+  you change `k3_math.h`, run the exhaustive check (about 15 minutes on 4 cores) and
+  update the digest in `tests/unit/test_math.c` only if it passes:
+
+  ```bash
+  tcc -I src/core -run tools/check_math.c 4 > close.txt
+  python3 tools/check_math_exact.py close.txt
+  ```
 - **Hot loops are written for TCC**, which does not inline, unroll or keep values in
   registers across statements. Follow "TCC-shaped dot products" in `src/core/k3_ops.c`:
   named accumulators, no function calls per element (`static inline` is still a call
