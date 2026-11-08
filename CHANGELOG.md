@@ -16,6 +16,41 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pinned fraction. Counting only: output is unchanged. This was also the cause of an
   intermittent `test_trunk` failure on CI, which now tests both interleavings.
 
+## [1.1.0-win.1] - 2026-11-08
+
+Windows x86-64 packaging release, published from the
+[s81/kimi-work-8Gb](https://github.com/s81/kimi-work-8Gb) fork. The engine is upstream
+1.1.0 plus the trunk-count fix listed under [Unreleased] above (upstream `7721a1b`).
+Nothing else in the engine source changed, so model output is identical to 1.1.0, and
+`k3 --help` still reports `1.1.0`.
+
+### Added
+
+- **Prebuilt Windows binaries** on the
+  [v1.1.0-win.1 release](https://github.com/s81/kimi-work-8Gb/releases/tag/v1.1.0-win.1):
+  `k3-1.1.0-windows-x64-avx2.zip` (`-mavx2 -mfma`, for Intel Haswell or newer and any AMD
+  Ryzen) and `k3-1.1.0-windows-x64-generic.zip` (baseline x86-64 for any 64-bit CPU,
+  using the scalar kernels), plus `SHA256SUMS.txt`. Both are built without
+  `-march=native` and statically linked, so they import only `KERNEL32.dll` and
+  `msvcrt.dll` and need no DLLs or installer.
+- **`scripts/build-windows.sh`** builds and zips both variants. It runs natively in the
+  MSYS2 MinGW64 shell, or cross-compiles from Linux/WSL with MinGW-w64 (the posix-threads
+  flavour, which has the pthreads and OpenMP the engine needs).
+- **`.github/workflows/windows-release.yml`** builds natively on `windows-latest`, runs
+  `make test` with the shipped avx2 flags, smoke-tests both exes from PowerShell, and on a
+  `v*` tag publishes a GitHub Release with the zips, checksums and notes from
+  `.github/release-notes/<tag>.md`.
+- **`docs/BUILD-WINDOWS.md`** covers downloading and building on Windows, and what was and
+  wasn't verified. The README links to it and to the release.
+
+### Verified
+
+- `make test` passes on `windows-latest` with the shipped avx2 flags (`22 passed, 0 failed,
+  0 skipped`, `VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY`), and also under Wine from a
+  Linux cross-compile.
+- Not verified: inference on real Kimi K3 weights on Windows, and tokenizer parity. Both
+  need the checkpoint, which CI doesn't have.
+
 ## [1.1.0] - 2026-10-02
 
 Chat, native Windows builds alongside Linux and macOS, an 8 GB class mode for the
@@ -269,6 +304,7 @@ First public release.
 See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 [Unreleased]: https://github.com/FareedKhan-dev/kimi-k3-in-c/compare/v1.1.0...HEAD
+[1.1.0-win.1]: https://github.com/s81/kimi-work-8Gb/releases/tag/v1.1.0-win.1
 [1.1.0]: https://github.com/FareedKhan-dev/kimi-k3-in-c/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/FareedKhan-dev/kimi-k3-in-c/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/FareedKhan-dev/kimi-k3-in-c/releases/tag/v0.1.0
