@@ -6,6 +6,10 @@
 # Executable text that must be LF on every platform, including a Windows checkout.
 *.sh    text eol=lf
 *.py    text eol=lf
+
+# Windows batch files are read by cmd.exe, which mishandles LF-only files in some cases
+# (labels and goto); keep them CRLF on every checkout.
+*.bat   text eol=crlf
 Makefile text eol=lf
 
 # Binary: never transform, and do not attempt a textual diff.

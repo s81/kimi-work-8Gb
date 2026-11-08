@@ -67,6 +67,21 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
+  # The path a Windows user follows: a fresh checkout, then setup.bat, which downloads
+  # and verifies the bootstrap TCC and the pinned TinyCC source, builds the compiler,
+  # builds k3 and runs the tests. Windows PowerShell 5.1, as shipped with Windows.
+  windows-setup:
+    name: setup.bat on a fresh checkout (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: setup.bat
+        shell: cmd
+        run: setup.bat
+      - name: The engine runs
+        shell: cmd
+        run: bin\k3.exe --version
+
   python-lint:
     name: python tools lint
     runs-on: ubuntu-latest
