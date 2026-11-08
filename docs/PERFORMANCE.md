@@ -204,7 +204,7 @@ not as the engine's speed.
 
 The figures in this document were measured with the previous GCC `-O3 -march=native`
 AVX2 build. The current build uses the Tiny C Compiler and runs the scalar kernels, which
-are about 14x slower on the compute side (README, *Building*); I/O-bound figures are
+are roughly 3-5x slower on the compute side (README, *Building*); I/O-bound figures are
 unaffected by the compiler.
 
 ```bash
