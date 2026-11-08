@@ -13,6 +13,7 @@
 #endif
 
 #include "k3_cache.h"
+#include "k3_par.h"
 
 static double now_s(void)
 {
@@ -147,6 +148,53 @@ static int64_t expert_chunk_bytes(void)
     return cached;
 }
 
+/* One expert of a cache_getmany batch. File scope (rather than local to cache_getmany)
+ * so the parallel read loop's body, a separate function, can see it. */
+typedef struct {
+    int slot; int expert; K3ExpertRef r; int64_t got, pad;
+    int64_t lo, len, chunk;   /* enclosing O_DIRECT window, divided into chunks */
+    int nchunk, cbase;
+} K3CacheWork;
+
+/* Body of the parallel loop in the function below, over k in [k3_b_, k3_e_). */
+typedef struct {
+    K3Cache * c;
+    K3CacheWork * w;
+    const int * owner;
+    const int * within;
+    int64_t * cgot;
+} k3_cache_read_items_ctx;
+static void k3_cache_read_items(void *k3_vctx_, int k3_b_, int k3_e_)
+{
+    const k3_cache_read_items_ctx *C = (const k3_cache_read_items_ctx *)k3_vctx_;
+    K3Cache * c = C->c;
+    K3CacheWork * w = C->w;
+    const int * owner = C->owner;
+    const int * within = C->within;
+    int64_t * cgot = C->cgot;
+    (void)c;
+    (void)w;
+    (void)owner;
+    (void)within;
+    (void)cgot;
+    for (int k = k3_b_; k < k3_e_; k++) {
+        const int i = owner[k];
+        unsigned char *dst = c->arena + (size_t)w[i].slot * c->slot_bytes;
+        if (!w[i].r.contiguous || w[i].nchunk == 1) {
+            int64_t pad = 0;
+            cgot[k] = k3_expert_load_direct(c->st, &w[i].r, dst, c->slot_bytes, &pad);
+            w[i].pad = pad;
+            continue;
+        }
+        const int64_t base = (int64_t)within[k] * w[i].chunk;
+        int64_t len = w[i].len - base;
+        if (len > w[i].chunk) len = w[i].chunk;
+        int64_t p = 0;
+        cgot[k] = k3_st_read_aligned(c->st, w[i].r.shard, w[i].lo + base, len,
+                                     dst + base, c->slot_bytes - base, &p);
+    }
+}
+
 /* Bring a whole top-k resident, with the reads issued CONCURRENTLY.
  *
  * The serial path admits one expert per call, so the drive sees a queue depth of one:
@@ -171,13 +219,8 @@ static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
     K3Cache *c = (K3Cache *)self;
     if (n <= 0) return 0;
 
-    typedef struct {
-        int slot; int expert; K3ExpertRef r; int64_t got, pad;
-        int64_t lo, len, chunk;   /* enclosing O_DIRECT window, divided into chunks */
-        int nchunk, cbase;
-    } Work;
     /* One entry per expert in a batch prefetch, so it is bounded by top-k. */
-    Work w[K3_MAX_TOPK];
+    K3CacheWork w[K3_MAX_TOPK];
     int nw = 0;
     const int cap = (int)(sizeof w / sizeof *w);
 
@@ -213,7 +256,7 @@ static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
      * sorting by where the bytes actually live turns a scattered set of seeks into a
      * mostly forward sweep. Insertion sort: nw is at most the top-k. */
     for (int i = 1; i < nw; i++) {
-        Work t = w[i]; int j = i - 1;
+        K3CacheWork t = w[i]; int j = i - 1;
         while (j >= 0 && (w[j].r.shard > t.r.shard ||
                          (w[j].r.shard == t.r.shard && w[j].r.off > t.r.off))) {
             w[j + 1] = w[j]; j--;
@@ -282,24 +325,9 @@ static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
     }
 
     const double t0 = now_s();
-#ifdef _OPENMP
-#   pragma omp parallel for schedule(dynamic, 1)
-#endif
-    for (int k = 0; k < nitem; k++) {
-        const int i = owner[k];
-        unsigned char *dst = c->arena + (size_t)w[i].slot * c->slot_bytes;
-        if (!w[i].r.contiguous || w[i].nchunk == 1) {
-            int64_t pad = 0;
-            cgot[k] = k3_expert_load_direct(c->st, &w[i].r, dst, c->slot_bytes, &pad);
-            w[i].pad = pad;
-            continue;
-        }
-        const int64_t base = (int64_t)within[k] * w[i].chunk;
-        int64_t len = w[i].len - base;
-        if (len > w[i].chunk) len = w[i].chunk;
-        int64_t p = 0;
-        cgot[k] = k3_st_read_aligned(c->st, w[i].r.shard, w[i].lo + base, len,
-                                     dst + base, c->slot_bytes - base, &p);
+    {
+        k3_cache_read_items_ctx k3_ctx_ = { .c = c, .w = w, .owner = owner, .within = within, .cgot = cgot };
+        k3_par_for_dynamic(nitem, k3_cache_read_items, &k3_ctx_);
     }
     c->load_seconds += now_s() - t0;
 

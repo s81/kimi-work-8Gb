@@ -18,6 +18,7 @@
 
 #include "json.h"
 #include "k3_st.h"
+#include "k3_par.h"
 #include "k3_trunk.h"
 
 static int k3_alloc_direct(void **out, size_t bytes);   /* defined below */
@@ -568,11 +569,44 @@ static int k3_alloc_direct(void **out, size_t bytes)
     return 0;
 }
 
+/* Body of load_run_to's parallel read, over chunks [b, e). `failed` is shared by every
+ * thread: any short read sets it and the remaining chunks are skipped. A plain volatile
+ * int is enough, as before: it only ever goes from 0 to 1, and the caller reads it after
+ * k3_par_for_dynamic returns, which joins every chunk under the pool's mutex. */
+typedef struct {
+    K3Trunk            *tr;
+    const K3TrunkLayer *lay;
+    unsigned char      *dst;
+    int64_t             nb;
+    volatile int        failed;
+} K3TrunkChunks;
+
+static void load_chunks(void *vjob, int b, int e)
+{
+    K3TrunkChunks *job = (K3TrunkChunks *)vjob;
+    const K3TrunkLayer *lay = job->lay;
+    const int64_t nb = job->nb;
+    for (int ci = b; ci < e; ci++) {
+        if (job->failed) continue;
+        const int64_t base = (int64_t)ci * K3_TRUNK_CHUNK;
+        const int64_t len = (nb - base < K3_TRUNK_CHUNK) ? nb - base : K3_TRUNK_CHUNK;
+        int64_t got = 0;
+        while (got < len) {
+            int64_t want = len - got;
+            if (want > K3_PREAD_MAX) want = K3_PREAD_MAX;
+            ssize_t r = pread(job->tr->fd, job->dst + base + got, (size_t)want,
+                              (int64_t)(lay->file_off + base + got));
+            if (r <= 0) { job->failed = 1; break; }
+            got += r;
+        }
+    }
+}
+
 /* One layer is ~1.17 GB. A single sequential pread loop leaves the drive at queue
  * depth 1 (issue, wait, issue), which on NVMe reaches roughly half its rated rate --
  * measured 3.1 GB/s here against 6.7 GB/s on the expert path, which already reads in
  * parallel (k3_cache.c cache_getmany). Splitting the layer into aligned chunks issued
- * under OpenMP gives the same depth. Chunks are multiples of K3_TRUNK_ALIGN and layer
+ * across the k3_par pool gives the same depth. Chunks are multiples of K3_TRUNK_ALIGN and layer
  * offsets/sizes are too, so every chunk's offset and length stay aligned -- required
  * by O_DIRECT on Linux and harmless to F_NOCACHE on Darwin. K3_TRUNK_CHUNK (64 MiB) is
  * defined at the top of the file, next to the ring size.
@@ -589,25 +623,10 @@ static int load_run_to(K3Trunk *tr, int L, unsigned char *dst,
     const double t0 = now_s();
     const int64_t nb = lay->nbytes;
     const int nchunk = (int)((nb + K3_TRUNK_CHUNK - 1) / K3_TRUNK_CHUNK);
-    volatile int failed = 0;
-#ifdef _OPENMP
-#   pragma omp parallel for schedule(dynamic, 1)
-#endif
-    for (int ci = 0; ci < nchunk; ci++) {
-        if (failed) continue;
-        const int64_t base = (int64_t)ci * K3_TRUNK_CHUNK;
-        const int64_t len = (nb - base < K3_TRUNK_CHUNK) ? nb - base : K3_TRUNK_CHUNK;
-        int64_t got = 0;
-        while (got < len) {
-            int64_t want = len - got;
-            if (want > K3_PREAD_MAX) want = K3_PREAD_MAX;
-            ssize_t r = pread(tr->fd, dst + base + got, (size_t)want,
-                              (off_t)(lay->file_off + base + got));
-            if (r <= 0) { failed = 1; break; }
-            got += r;
-        }
-    }
-    if (failed) {
+    K3TrunkChunks job;
+    job.tr = tr; job.lay = lay; job.dst = dst; job.nb = nb; job.failed = 0;
+    k3_par_for_dynamic(nchunk, load_chunks, &job);
+    if (job.failed) {
         fprintf(stderr, "k3_trunk: short read on layer %d\n", L);
         /* Chunks complete in any order, so a partial count would be meaningless;
          * charge nothing for a layer that was not read, exactly as before. */

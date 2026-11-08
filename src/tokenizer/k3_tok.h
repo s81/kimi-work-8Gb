@@ -50,16 +50,9 @@
 #include "json.h"
 
 /* tok.h is a header-only library, vendored unmodified (see NOTICE). Every function in it
- * has file scope, so a translation unit that uses only part of the API draws
- * -Wunused-function for the remainder.
- *
- * The suppression is scoped to this include rather than added to CFLAGS. A global
- * suppression would also silence unused-function warnings in first-party code, where
- * they indicate genuine dead code and should still fail the build. */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
+ * has file scope, so a translation unit uses only part of the API; TCC does not warn
+ * about unused static functions, so no suppression is needed. */
 #include "tok.h"
-#pragma GCC diagnostic pop
 
 /* Vocabulary ceiling from config.json text_config.vocab_size. Ranks occupy
  * [0, 163584) and the added tokens land above that, so one array of this size covers

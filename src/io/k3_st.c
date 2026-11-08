@@ -321,7 +321,7 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
     uint64_t hlen = 0;
     for (int i = 7; i >= 0; i--) hlen = (hlen << 8) | lenbuf[i];   /* little endian */
 
-    off_t fsize = lseek(fd, 0, SEEK_END);
+    const int64_t fsize = (int64_t)lseek(fd, 0, SEEK_END);
     /* Subtraction, not addition: 8 + hlen wraps to small when hlen is near
      * 2^64 (a corrupt or hostile first 8 bytes), passing the check with a
      * malloc(0) followed by a giant pread -- a heap overflow that _FORTIFY_
@@ -788,7 +788,7 @@ int64_t k3_st_read_aligned(const K3St *s, int shard, int64_t off, int64_t nbytes
         int64_t got = 0;
         while (got < nbytes) {
             ssize_t r = pread(s->fd[shard], (char *)buf + got,
-                              (size_t)(nbytes - got), (off_t)(off + got));
+                              (size_t)(nbytes - got), (int64_t)(off + got));
             if (r <= 0) return got;
             got += r;
         }
@@ -806,7 +806,7 @@ int64_t k3_st_read_aligned(const K3St *s, int shard, int64_t off, int64_t nbytes
     int64_t got = 0;
     while (got < len) {
         const int64_t req = (len - got < K3_PREAD_MAX) ? (len - got) : K3_PREAD_MAX;
-        ssize_t r = pread(dfd, (char *)buf + got, (size_t)req, (off_t)(lo + got));
+        ssize_t r = pread(dfd, (char *)buf + got, (size_t)req, (int64_t)(lo + got));
         if (r <= 0) {
             /* The final window of a shard can extend past EOF, which is a short read
              * rather than an error. Accept it once the payload itself is covered. */
@@ -826,7 +826,7 @@ int64_t k3_st_read(const K3St *s, const K3Tensor *t, void *buf)
         const int64_t remain = t->nbytes - got;
         const int64_t req = remain < K3_PREAD_MAX ? remain : K3_PREAD_MAX;
         ssize_t r = pread(s->fd[t->shard], (char *)buf + got,
-                          (size_t)req, (off_t)(t->off + got));
+                          (size_t)req, (int64_t)(t->off + got));
         if (r <= 0) {
             fprintf(stderr, "k3_st: short read on %s at +%lld\n", t->name, (long long)got);
             return got;
@@ -866,7 +866,7 @@ int64_t k3_st_read_f32(const K3St *s, const K3Tensor *t, float *out)
         int64_t got = 0;
         while (got < want) {
             ssize_t r = pread(s->fd[t->shard], (char *)raw + got, (size_t)(want - got),
-                              (off_t)(t->off + done * esz + got));
+                              (int64_t)(t->off + done * esz + got));
             if (r <= 0) {
                 fprintf(stderr, "k3_st: short read widening %s at element %lld\n",
                         t->name, (long long)done);
