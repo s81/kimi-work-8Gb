@@ -48,7 +48,7 @@ checkout on every push.
 Check a download in PowerShell:
 
 ```powershell
-Get-FileHash .\k3-1.2.2-windows-x64.zip -Algorithm SHA256   # compare with SHA256SUMS.txt
+Get-FileHash .\k3-1.2.3-windows-x64.zip -Algorithm SHA256   # compare with SHA256SUMS.txt
 .\k3.exe --help
 ```
 
