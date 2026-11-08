@@ -272,12 +272,19 @@ single runs from earlier sessions. Against v1.2.0 the current kernels are about 
 faster, which leaves TCC roughly 2x behind GCC AVX2 on bf16 and 2-3x on MXFP4. Treat the
 GCC ratio as approximate: it compares best-of-12 against single runs from another session.
 
-The **results are bit-identical** across all three columns: every build prints the same
+The **results are bit-identical** across every column: every build prints the same
 output digests, because the scalar and AVX2 kernels share one summation order by design. The thread pool
 ([`src/core/k3_par.h`](src/core/k3_par.h)) replaces OpenMP and scales 3.6-3.9x on those 4
 cores. The measured time-per-token figures elsewhere in this README come from the GCC build
 and are not what this build achieves; compute-bound runs are slower by about the ratios
 above.
+
+**Checked on real weights.** The TCC build has been run against four of the released
+shards (layers 0 and 1, embedding and head, about 24 GB) on Linux. `test-all` passes, the
+torch comparison (`tools/verify_real_layer.py`) confirms every layer-1 binding at
+float32 rounding, and tokenizer parity is 45/45. The full 93-layer model and Windows
+have not been run on real weights. How to repeat it, and the recorded results:
+[docs/TESTING.md](docs/TESTING.md), *Without the whole checkpoint*.
 
 The tokenizer and config reader are portable C99 and build anywhere. Without a checkpoint
 you can still do everything in [Quick start](#quick-start).
