@@ -134,6 +134,39 @@ static void fillbf16(uint16_t *p, size_t n, unsigned s)
 
 static void pool_noop(void *ctx, int b, int e) { (void)ctx; (void)b; (void)e; }
 
+/* The MXFP4 matmul on one thread and on the default count: how much the pool actually
+ * buys on this machine. Thread wake-up cost differs a lot between platforms. */
+static void pool_scaling(void)
+{
+    const int in = 3584, rows = 3072, group = K3_MXFP4_GROUP;
+    const int pcols = in / 2, ngrp = in / group;
+    unsigned char *pk = (unsigned char *)malloc((size_t)rows * pcols);
+    unsigned char *sc = (unsigned char *)malloc((size_t)rows * ngrp);
+    float *x = (float *)malloc((size_t)in * sizeof(float));
+    float *y = (float *)malloc((size_t)rows * sizeof(float));
+    if (!pk || !sc || !x || !y) { printf("alloc failed\n"); return; }
+    fillb(pk, (size_t)rows * pcols, 777u);
+    memset(sc, 127, (size_t)rows * ngrp);
+    fillf(x, in, 4242u);
+    const int threads = k3_par_threads();
+    double best[2];
+    for (int pass = 0; pass < 2; pass++) {
+        k3_par_set_threads(pass == 0 ? 1 : threads);
+        double t[REPS], med;
+        k3_matmul_mxfp4(y, x, pk, sc, in, rows, group);
+        for (int r = 0; r < REPS; r++) {
+            const double t0 = now_s();
+            k3_matmul_mxfp4(y, x, pk, sc, in, rows, group);
+            t[r] = now_s() - t0;
+        }
+        best_median(t, &best[pass], &med);
+    }
+    k3_par_set_threads(threads);
+    printf("\npool scaling, MXFP4 3072 x 3584: 1 thread %.2f ms, %d threads %.2f ms -> %.2fx\n",
+           best[0] * 1e3, threads, best[1] * 1e3, best[0] / best[1]);
+    free(pk); free(sc); free(x); free(y);
+}
+
 /* The non-matmul kernels at real width, single-threaded calls. Per-token counts:
  * 69 KDA layers x 96 heads for the step; about 17 SiTU-GLU calls (16 routed experts
  * plus the shared pair) per MoE layer; 2 rmsnorms per layer; one ShortConv over the
@@ -262,6 +295,7 @@ int main(void)
     printf("\nmeasured compute budget at the floor is about 10 s/token; whichever line\n"
            "above dominates it is the one worth vectorising.\n");
 
+    pool_scaling();
     other_kernels();
     return 0;
 }
