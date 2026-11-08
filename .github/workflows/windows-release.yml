@@ -24,7 +24,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # mingw-w64-x86_64-libgomp is listed explicitly: it is only an optional
       # dependency of the gcc package, and the -static link needs its archive.
@@ -90,7 +90,7 @@ jobs:
       contents: write
     steps:
       # Only the release-notes directory is needed here, not the whole tree.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           sparse-checkout: .github/release-notes
 
