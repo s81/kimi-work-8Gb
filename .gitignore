@@ -63,3 +63,6 @@ venv/
 
 # Release zips (tcc -run build.c dist)
 /dist/
+
+# Windows toolchain built by setup.bat (scripts/setup-windows.ps1)
+/.tcc/

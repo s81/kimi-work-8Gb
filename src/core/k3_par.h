@@ -26,8 +26,10 @@
 /* Loop body: run iterations [begin, end). ctx is the caller's private state. */
 typedef void (*k3_par_fn)(void *ctx, int begin, int end);
 
-/* Parallel for over [0, n), split into one contiguous block per thread (OpenMP's
- * schedule(static)). Runs serially when n <= serial_max, or with one thread. */
+/* Parallel for over [0, n), split into K3_PAR_BLOCKS contiguous blocks per thread that
+ * threads claim in order (OpenMP's schedule(static) with a smaller chunk). Runs serially
+ * when n <= serial_max, or with one thread. Which thread runs a block never changes a
+ * result; see DETERMINISM. */
 void k3_par_for(int n, int serial_max, k3_par_fn fn, void *ctx);
 
 /* Parallel for over [0, n) handing out one iteration at a time (OpenMP's

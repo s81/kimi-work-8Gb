@@ -47,6 +47,15 @@ jobs:
           grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY"  "$RUNNER_TEMP/test.log"
           grep -q "ALL WEIGHTLESS TESTS PASSED"                    "$RUNNER_TEMP/test.log"
 
+      # Kernel timings at real Kimi K3 dimensions on this runner, so Linux and Windows
+      # are measured on comparable machines every push. Informational: shared runners
+      # vary by tens of percent, so this never fails the build. Output digests that
+      # differ between the two OSes point at a libm difference (expf, tanhf), not a bug.
+      - name: Kernel benchmark (informational)
+        shell: bash
+        continue-on-error: true
+        run: tcc -run build.c bench
+
       # The release zip for this platform, so every run has a downloadable build.
       - name: tcc -run build.c dist
         shell: bash
@@ -57,6 +66,21 @@ jobs:
           name: k3-${{ runner.os }}-x64
           path: dist/*.zip
           if-no-files-found: error
+
+  # The path a Windows user follows: a fresh checkout, then setup.bat, which downloads
+  # and verifies the bootstrap TCC and the pinned TinyCC source, builds the compiler,
+  # builds k3 and runs the tests. Windows PowerShell 5.1, as shipped with Windows.
+  windows-setup:
+    name: setup.bat on a fresh checkout (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: setup.bat
+        shell: cmd
+        run: setup.bat
+      - name: The engine runs
+        shell: cmd
+        run: bin\k3.exe --version
 
   python-lint:
     name: python tools lint

@@ -216,9 +216,27 @@ static jval *j_parse_num(jparser *p) {
         do s++; while (*s >= '0' && *s <= '9');
     }
     {
+        /* strtod on a COPY of the token, never on p->s in place. Microsoft's
+         * msvcrt.dll strtod measures the whole remaining input with strlen
+         * before it parses, so calling it inside a multi-megabyte document is
+         * quadratic: the 9 MB of op fixtures took 334 s to load on Windows and
+         * well under a second elsewhere. The token is already validated above
+         * and strtod stops at the same character either way, so the value is
+         * identical on every platform. */
+        const size_t len = (size_t)(s - p->s);
+        char small[64], *heap = NULL, *num = small;
+        if (len >= sizeof small) {
+            heap = (char *)malloc(len + 1);
+            if (!heap) { p->oom = 1; return NULL; }
+            num = heap;
+        }
+        memcpy(num, p->s, len);
+        num[len] = '\0';
         char *end = NULL;
-        double d = strtod(p->s, &end);
-        if (end != s || !isfinite(d)) return NULL;
+        double d = strtod(num, &end);
+        const int whole = (end == num + len);
+        free(heap);
+        if (!whole || !isfinite(d)) return NULL;
         p->s = s;
         jval *v = j_new(p, J_NUM);
         if (!v) return NULL;

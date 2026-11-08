@@ -225,8 +225,7 @@ static void usage(FILE *f)
 "\n"
 "prompt (exactly one):\n"
 "  --prompt TEXT         tokenize TEXT and run it\n"
-"  --prompt-file PATH    read the prompt from a file; use this for non-ASCII, since\n"
-"                        argv is re-encoded by the shell\n"
+"  --prompt-file PATH    read the prompt from a file, byte for byte (UTF-8)\n"
 "  --ids 1,2,3           raw token ids; the reproducible channel used by the tests\n"
 "\n"
 "memory:\n"
@@ -780,6 +779,9 @@ static int parse_int_strict(const char *s, int *out)
 
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+    k3_win_utf8_main(&argc, &argv);   /* UTF-8 argv and console; src/compat/k3_win32.h */
+#endif
     /* Informational flags are answered before anything else, because they must work
      * without a model directory, `k3 --help` on a machine with no checkpoint is the
      * first thing most people type. */
