@@ -104,19 +104,15 @@ static double k3_win_fma(double a, double b, double c) { return a * b + c; }
 #define fma(a, b, c) k3_win_fma((a), (b), (c))
 
 /* ---------------------------------------------------- float maths, msvcrt -- */
-/* The 64-bit msvcrt.dll that TCC links against exports the double versions of these but
- * not the float ones. Each is computed in double and rounded once to float:
- *   sqrtf: exactly the correctly rounded result (double has more than twice float's
- *          precision, so the double rounding cannot change it).
- *   expf, tanhf: within the last bit of any libm's float version, which is the same
- *          freedom every C library already takes (glibc, MinGW and Apple's differ), and
- *          the test suite's tolerances were set across those libraries. */
-static float k3_win_expf(float x)  { return (float)exp((double)x); }
+/* The 64-bit msvcrt.dll that TCC links against exports sqrt() but not sqrtf(). sqrt in
+ * double, rounded once to float, is exactly the correctly rounded sqrtf: double has more
+ * than twice float's precision, so the double rounding cannot change it.
+ *
+ * expf and tanhf are not mapped here on purpose. The engine uses k3_expf and k3_tanhf
+ * (src/core/k3_math.h), which are correctly rounded in plain C and give the same bits
+ * on Windows and Linux; msvcrt's exp() and tanh() would not. */
 static float k3_win_sqrtf(float x) { return (float)sqrt((double)x); }
-static float k3_win_tanhf(float x) { return (float)tanh((double)x); }
-#define expf(x)  k3_win_expf(x)
 #define sqrtf(x) k3_win_sqrtf(x)
-#define tanhf(x) k3_win_tanhf(x)
 
 /* --------------------------------------------------------- strtoll/strtoull -- */
 /* msvcrt.dll has the same conversions under Microsoft's names. Newer TCC headers

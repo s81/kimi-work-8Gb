@@ -69,6 +69,7 @@ static const Target CLI = {
 /* Tests that need no checkpoint. Each links only what it needs, so a failure points at
  * one subsystem. */
 static const Target TESTS[] = {
+    { "test_math",         "tests/unit/test_math.c" },
     { "test_ops",          "tests/unit/test_ops.c " OPS },
     { "test_cache",        "tests/unit/test_cache.c src/cache/k3_cache.c src/io/k3_load.c "
                            "src/io/k3_st.c " OPS },
@@ -288,6 +289,7 @@ static void test(void)
         printf("  6 malformed numerics refused, each for the right reason\n");
     }
 
+    step("expf and tanhf");    must_pass("test_math", "");
     step("op kernels");        must_pass("test_ops", "tests/fixtures/ops");
     step("streaming cache");   must_pass("test_cache", "tests/fixtures/cache");
     step("streaming cache, split reads");
