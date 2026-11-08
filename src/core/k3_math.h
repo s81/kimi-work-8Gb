@@ -40,45 +40,45 @@
 #define K3_MATH_H
 
 #include <stdint.h>
-#include <string.h>
 
-static double k3m_d(uint64_t u) { double d; memcpy(&d, &u, sizeof d); return d; }
-static uint64_t k3m_u(double d) { uint64_t u; memcpy(&u, &d, sizeof u); return u; }
+typedef union { uint64_t u; double d; } k3m_bits;   /* type punning through a union: C99 */
+static double k3m_d(uint64_t u) { k3m_bits b; b.u = u; return b.d; }
+static uint64_t k3m_u(double d) { k3m_bits b; b.d = d; return b.u; }
 
 /* 2^(j/32) = hi + lo, both doubles, from a 300-bit computation. */
-static const uint64_t K3M_EXP2_32[32][2] = {
-    { 0x3ff0000000000000ULL, 0x0000000000000000ULL },
-    { 0x3ff059b0d3158574ULL, 0x3c8d73e2a475b465ULL },
-    { 0x3ff0b5586cf9890fULL, 0x3c98a62e4adc610bULL },
-    { 0x3ff11301d0125b51ULL, 0xbc96c51039449b3aULL },
-    { 0x3ff172b83c7d517bULL, 0xbc819041b9d78a76ULL },
-    { 0x3ff1d4873168b9aaULL, 0x3c9e016e00a2643cULL },
-    { 0x3ff2387a6e756238ULL, 0x3c99b07eb6c70573ULL },
-    { 0x3ff29e9df51fdee1ULL, 0x3c8612e8afad1255ULL },
-    { 0x3ff306fe0a31b715ULL, 0x3c86f46ad23182e4ULL },
-    { 0x3ff371a7373aa9cbULL, 0xbc963aeabf42eae2ULL },
-    { 0x3ff3dea64c123422ULL, 0x3c8ada0911f09ebcULL },
-    { 0x3ff44e086061892dULL, 0x3c489b7a04ef80d0ULL },
-    { 0x3ff4bfdad5362a27ULL, 0x3c7d4397afec42e2ULL },
-    { 0x3ff5342b569d4f82ULL, 0xbc807abe1db13cadULL },
-    { 0x3ff5ab07dd485429ULL, 0x3c96324c054647adULL },
-    { 0x3ff6247eb03a5585ULL, 0xbc9383c17e40b497ULL },
-    { 0x3ff6a09e667f3bcdULL, 0xbc9bdd3413b26456ULL },
-    { 0x3ff71f75e8ec5f74ULL, 0xbc816e4786887a99ULL },
-    { 0x3ff7a11473eb0187ULL, 0xbc841577ee04992fULL },
-    { 0x3ff82589994cce13ULL, 0xbc9d4c1dd41532d8ULL },
-    { 0x3ff8ace5422aa0dbULL, 0x3c96e9f156864b27ULL },
-    { 0x3ff93737b0cdc5e5ULL, 0xbc675fc781b57ebcULL },
-    { 0x3ff9c49182a3f090ULL, 0x3c7c7c46b071f2beULL },
-    { 0x3ffa5503b23e255dULL, 0xbc9d2f6edb8d41e1ULL },
-    { 0x3ffae89f995ad3adULL, 0x3c97a1cd345dcc81ULL },
-    { 0x3ffb7f76f2fb5e47ULL, 0xbc75584f7e54ac3bULL },
-    { 0x3ffc199bdd85529cULL, 0x3c811065895048ddULL },
-    { 0x3ffcb720dcef9069ULL, 0x3c7503cbd1e949dbULL },
-    { 0x3ffd5818dcfba487ULL, 0x3c82ed02d75b3707ULL },
-    { 0x3ffdfc97337b9b5fULL, 0xbc91a5cd4f184b5cULL },
-    { 0x3ffea4afa2a490daULL, 0xbc9e9c23179c2893ULL },
-    { 0x3fff50765b6e4540ULL, 0x3c99d3e12dd8a18bULL },
+static const k3m_bits K3M_EXP2_32[32][2] = {
+    { { 0x3ff0000000000000ULL }, { 0x0000000000000000ULL } },
+    { { 0x3ff059b0d3158574ULL }, { 0x3c8d73e2a475b465ULL } },
+    { { 0x3ff0b5586cf9890fULL }, { 0x3c98a62e4adc610bULL } },
+    { { 0x3ff11301d0125b51ULL }, { 0xbc96c51039449b3aULL } },
+    { { 0x3ff172b83c7d517bULL }, { 0xbc819041b9d78a76ULL } },
+    { { 0x3ff1d4873168b9aaULL }, { 0x3c9e016e00a2643cULL } },
+    { { 0x3ff2387a6e756238ULL }, { 0x3c99b07eb6c70573ULL } },
+    { { 0x3ff29e9df51fdee1ULL }, { 0x3c8612e8afad1255ULL } },
+    { { 0x3ff306fe0a31b715ULL }, { 0x3c86f46ad23182e4ULL } },
+    { { 0x3ff371a7373aa9cbULL }, { 0xbc963aeabf42eae2ULL } },
+    { { 0x3ff3dea64c123422ULL }, { 0x3c8ada0911f09ebcULL } },
+    { { 0x3ff44e086061892dULL }, { 0x3c489b7a04ef80d0ULL } },
+    { { 0x3ff4bfdad5362a27ULL }, { 0x3c7d4397afec42e2ULL } },
+    { { 0x3ff5342b569d4f82ULL }, { 0xbc807abe1db13cadULL } },
+    { { 0x3ff5ab07dd485429ULL }, { 0x3c96324c054647adULL } },
+    { { 0x3ff6247eb03a5585ULL }, { 0xbc9383c17e40b497ULL } },
+    { { 0x3ff6a09e667f3bcdULL }, { 0xbc9bdd3413b26456ULL } },
+    { { 0x3ff71f75e8ec5f74ULL }, { 0xbc816e4786887a99ULL } },
+    { { 0x3ff7a11473eb0187ULL }, { 0xbc841577ee04992fULL } },
+    { { 0x3ff82589994cce13ULL }, { 0xbc9d4c1dd41532d8ULL } },
+    { { 0x3ff8ace5422aa0dbULL }, { 0x3c96e9f156864b27ULL } },
+    { { 0x3ff93737b0cdc5e5ULL }, { 0xbc675fc781b57ebcULL } },
+    { { 0x3ff9c49182a3f090ULL }, { 0x3c7c7c46b071f2beULL } },
+    { { 0x3ffa5503b23e255dULL }, { 0xbc9d2f6edb8d41e1ULL } },
+    { { 0x3ffae89f995ad3adULL }, { 0x3c97a1cd345dcc81ULL } },
+    { { 0x3ffb7f76f2fb5e47ULL }, { 0xbc75584f7e54ac3bULL } },
+    { { 0x3ffc199bdd85529cULL }, { 0x3c811065895048ddULL } },
+    { { 0x3ffcb720dcef9069ULL }, { 0x3c7503cbd1e949dbULL } },
+    { { 0x3ffd5818dcfba487ULL }, { 0x3c82ed02d75b3707ULL } },
+    { { 0x3ffdfc97337b9b5fULL }, { 0xbc91a5cd4f184b5cULL } },
+    { { 0x3ffea4afa2a490daULL }, { 0xbc9e9c23179c2893ULL } },
+    { { 0x3fff50765b6e4540ULL }, { 0x3c99d3e12dd8a18bULL } },
 };
 #define K3M_LN2_32_HI   0x3f962e42ff000000ULL  /* ln2/32, 25 significant bits: k*hi is exact */
 #define K3M_LN2_32_LO   0xbd7718432a1b0e26ULL  /* ln2/32 - hi                               */
@@ -154,8 +154,8 @@ static void k3m_expm1_small(double rh, double rl, double *qh, double *ql)
     *ql = rl + (r2 * p + rl * rh);
 }
 
-/* k3_expf(x): e^x correctly rounded to float. */
-static float k3_expf(float x)
+/* The accurate path: e^x correctly rounded, for every float x (checked on all 2^32). */
+static float k3m_expf_acc(float x)
 {
     if (x != x) return x + x;                    /* NaN */
     if (x > 89.0f)   return (float)(1e300 * 1e300);   /* overflow, also +inf */
@@ -168,7 +168,7 @@ static float k3_expf(float x)
     k3m_expm1_small(rh, rl, &qh, &ql);
 
     /* T * (1 + q) = Th + (Tl + Th*qh + (Th*ql + Tl*qh)), T = Th + Tl */
-    const double th = k3m_d(K3M_EXP2_32[j][0]), tl = k3m_d(K3M_EXP2_32[j][1]);
+    const double th = k3m_d(K3M_EXP2_32[j][0].u), tl = k3m_d(K3M_EXP2_32[j][1].u);
     const double rest = tl + (th * qh + (th * ql + tl * qh));
     double s, e;
     k3m_two_sum(th, rest, &s, &e);
@@ -176,8 +176,8 @@ static float k3_expf(float x)
     return k3m_round_odd_to_float(s * sc, e * sc);
 }
 
-/* k3_tanhf(x): tanh(x) correctly rounded to float. */
-static float k3_tanhf(float x)
+/* The accurate path: tanh(x) correctly rounded, for every float x (checked on all 2^32). */
+static float k3m_tanhf_acc(float x)
 {
     if (x != x) return x + x;                    /* NaN */
     const double a = x < 0.0f ? -(double)x : (double)x;
@@ -206,7 +206,7 @@ static float k3_tanhf(float x)
         const int m = (k - j) / 32;
         k3m_expm1_small(rh, rl, &qh, &ql);
         const double sc = k3m_pow2(m);
-        const double th = k3m_d(K3M_EXP2_32[j][0]), tl = k3m_d(K3M_EXP2_32[j][1]);
+        const double th = k3m_d(K3M_EXP2_32[j][0].u), tl = k3m_d(K3M_EXP2_32[j][1].u);
 
         double ph, pe;                           /* th*qh exactly */
         k3m_two_prod(th, qh, &ph, &pe);
@@ -233,6 +233,77 @@ static float k3_tanhf(float x)
         r = k3m_round_odd_to_float(s, e);
     }
     return (k3m_u((double)x) >> 63) ? -r : r;   /* the sign bit, so tanh(-0) = -0 */
+}
+
+/* ------------------------------------------------------------- fast paths --
+ * The accurate paths above cost about 30 function calls under TCC, which inlines
+ * nothing. Almost every input needs far less: a plain double approximation v whose
+ * relative error is known to be below eps rounds to the right float whenever v*(1-eps)
+ * and v*(1+eps) round to the SAME float, because rounding is monotonic and the exact
+ * value lies between them. Only when that interval straddles a rounding boundary
+ * (about 2 in 2^17 calls for tanh, 2 in 2^21 for exp) is the accurate path taken. The
+ * result is therefore the accurate path's result on every input, and the exhaustive
+ * check covers the combination as built.
+ *
+ * Error budgets (relative, rounding errors included, |r| <= ln2/64 = 2^-6.5):
+ *   e^y: Taylor to r^6, truncation r^7/7! < 2^-58; T[j] rounded to double 2^-53;
+ *        three roundings; total below 2^-51. eps = 2^-46.
+ *   tanh, |x| < 2^-5: series to x^11 as in the accurate path, below 2^-51. eps = 2^-46.
+ *   tanh, otherwise: (e - 1)/(e + 1) with e = e^(2|x|) as above; e/(e - 1) <= 16.5
+ *        magnifies e's error at most 2^4.05, so below 2^-46.5. eps = 2^-42. */
+#define K3M_EPS46 1.4210854715202004e-14   /* 2^-46 */
+#define K3M_EPS42 2.2737367544323206e-13   /* 2^-42 */
+/* The reduction constants as doubles, from the same bit patterns as the accurate path. */
+static const k3m_bits K3M_RED[3] = { { K3M_INV_LN2_32 }, { K3M_LN2_32_HI }, { K3M_LN2_32_LO } };
+
+static float k3_expf(float x)
+{
+    if (!(x > -104.0f && x < 89.0f)) return k3m_expf_acc(x);   /* NaN, inf, edges */
+    const double y  = (double)x;
+    const double z  = y * K3M_RED[0].d;                        /* 32/ln2 (only picks k) */
+    const double kd = (z + 6755399441055744.0) - 6755399441055744.0;
+    const double r  = (y - kd * K3M_RED[1].d) - kd * K3M_RED[2].d;
+    const int k = (int)kd, j = k & 31, m = (k - j) / 32;
+    const double p = r * (1.0 + r * (0.5 + r * (1.0 / 6.0 + r * (1.0 / 24.0
+                   + r * (1.0 / 120.0 + r * (1.0 / 720.0))))));
+    const double th = K3M_EXP2_32[j][0].d;
+    k3m_bits sc; sc.u = (uint64_t)(m + 1023) << 52;
+    const double v = (th + th * p) * sc.d;
+    const float lo = (float)(v * (1.0 - K3M_EPS46)), hi = (float)(v * (1.0 + K3M_EPS46));
+    if (lo == hi) return lo;
+    return k3m_expf_acc(x);
+}
+
+static float k3_tanhf(float x)
+{
+    union { float f; uint32_t u; } ux; ux.f = x;
+    const double a = (double)x < 0.0 ? -(double)x : (double)x;
+    if (!(a < 10.0)) return k3m_tanhf_acc(x);                  /* NaN, |x| >= 10 */
+    double v, eps;
+    if (a < 0.03125) {
+        const double t = a * a;
+        const double p = -1.0 / 3.0 + t * (2.0 / 15.0 + t * (-17.0 / 315.0
+                       + t * (62.0 / 2835.0 + t * (-1382.0 / 155925.0))));
+        v = a + a * (t * p);
+        eps = K3M_EPS46;
+    } else {
+        const double y  = a + a;
+        const double z  = y * K3M_RED[0].d;
+        const double kd = (z + 6755399441055744.0) - 6755399441055744.0;
+        const double r  = (y - kd * K3M_RED[1].d) - kd * K3M_RED[2].d;
+        const int k = (int)kd, j = k & 31, m = (k - j) / 32;
+        const double p = r * (1.0 + r * (0.5 + r * (1.0 / 6.0 + r * (1.0 / 24.0
+                       + r * (1.0 / 120.0 + r * (1.0 / 720.0))))));
+        const double th = K3M_EXP2_32[j][0].d;
+        k3m_bits sc; sc.u = (uint64_t)(m + 1023) << 52;
+        const double e = (th + th * p) * sc.d;
+        v = (e - 1.0) / (e + 1.0);
+        eps = K3M_EPS42;
+    }
+    if (a == 0.0) return x;                                    /* +-0, sign kept */
+    const float lo = (float)(v * (1.0 - eps)), hi = (float)(v * (1.0 + eps));
+    if (lo == hi) return (ux.u >> 31) ? -lo : lo;
+    return k3m_tanhf_acc(x);
 }
 
 #endif /* K3_MATH_H */
