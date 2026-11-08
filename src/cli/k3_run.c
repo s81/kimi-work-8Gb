@@ -780,6 +780,9 @@ static int parse_int_strict(const char *s, int *out)
 
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+    k3_win_utf8_main(&argc, &argv);   /* UTF-8 argv and console; src/compat/k3_win32.h */
+#endif
     /* Informational flags are answered before anything else, because they must work
      * without a model directory, `k3 --help` on a machine with no checkpoint is the
      * first thing most people type. */

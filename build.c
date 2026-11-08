@@ -85,6 +85,7 @@ static const Target TESTS[] = {
     { "test_chat",         "tests/unit/test_chat.c src/chat/k3_chat.c src/chat/k3_sampler.c" },
     { "test_sampler",      "tests/unit/test_sampler.c src/chat/k3_sampler.c" },
     { "test_prefix",       "tests/unit/test_prefix.c" },
+    { "test_utf8",         "tests/unit/test_utf8.c" },
     { "scale_test",        "tests/unit/scale_test.c " OPS },
     { "test_trunk",        "tests/unit/test_trunk.c src/io/k3_trunk.c src/io/k3_st.c "
                            "src/model/k3_bind.c " OPS },
@@ -350,6 +351,7 @@ static void test(void)
 
     step("sampler");           must_pass("test_sampler", "");
     step("chat prefix record"); must_pass("test_prefix", "");
+    step("non-ASCII names");   must_pass("test_utf8", "build/utf8");
     step("real dimensions");   must_pass("scale_test", "");
     step("trunk streaming");   must_pass("test_trunk", "");
     step("full-model oracle"); must_pass("k3_model", "tests/fixtures");

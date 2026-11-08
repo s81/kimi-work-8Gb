@@ -175,9 +175,14 @@ static inline int k3_win_open(const char *path, int flags, ...)
         crtFlags = _O_RDWR;
     }
 
-    HANDLE h = CreateFileA(path, access,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE,
-                            NULL, OPEN_EXISTING, fileFlags, NULL);
+    /* UTF-8 path, as everywhere in this codebase; see "UTF-8 on Windows" in
+     * src/compat/k3_win32.h. */
+    wchar_t *wpath = k3_win_widen(path);
+    if (!wpath) { errno = ENOMEM; return -1; }
+    HANDLE h = CreateFileW(wpath, access,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, fileFlags, NULL);
+    free(wpath);
     if (h == INVALID_HANDLE_VALUE) { errno = ENOENT; return -1; }
 
     int fd = _open_osfhandle((intptr_t)h, crtFlags | _O_BINARY);
@@ -208,6 +213,55 @@ static inline int posix_memalign(void **out, size_t align, size_t len)
  * delimiter is kept; the return is the number of bytes read, or -1 at EOF with nothing
  * read or on allocation failure. fgetc rather than fgets so an embedded NUL in the line
  * cannot silently truncate the count. */
+/* A line typed at a Windows console, as UTF-8. The C runtime reads console input in the
+ * console's code page, and with that set to UTF-8 the byte-oriented read returns nothing
+ * for non-ASCII characters on many Windows versions, so a prompt typed in Chinese came
+ * through empty. ReadConsoleW returns the UTF-16 the user typed, converted here; the
+ * line keeps its '\n', as getline's does. Ctrl-Z at the start of a line is EOF, as for
+ * the runtime. Returns -2 when the console read itself fails, so the caller falls back
+ * to the byte path. */
+static inline long long k3_win_console_getline(char **lineptr, size_t *n, HANDLE in)
+{
+    wchar_t buf[512];
+    wchar_t *w = NULL;
+    size_t wlen = 0, wcap = 0;
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadConsoleW(in, buf, (DWORD)(sizeof buf / sizeof buf[0]), &got, NULL)) {
+            free(w);
+            return -2;
+        }
+        if (got == 0) break;
+        if (wlen + got + 1 > wcap) {
+            size_t cap = wcap ? wcap * 2 : 1024;
+            while (cap < wlen + got + 1) cap *= 2;
+            wchar_t *grown = (wchar_t *)realloc(w, cap * sizeof(wchar_t));
+            if (!grown) { free(w); errno = ENOMEM; return -1; }
+            w = grown; wcap = cap;
+        }
+        memcpy(w + wlen, buf, got * sizeof(wchar_t));
+        wlen += got;
+        if (w[wlen - 1] == L'\n') break;
+    }
+    if (wlen == 0 || w[0] == 0x1A) { free(w); return -1; }      /* EOF or Ctrl-Z */
+    if (wlen >= 2 && w[wlen - 2] == L'\r' && w[wlen - 1] == L'\n') {
+        w[wlen - 2] = L'\n'; wlen--;                           /* CRLF -> LF */
+    }
+    w[wlen] = 0;
+    char *u = k3_win_narrow(w);
+    free(w);
+    if (!u) { errno = ENOMEM; return -1; }
+    const size_t len = strlen(u);
+    if (*n < len + 1) {
+        char *grown = (char *)realloc(*lineptr, len + 1);
+        if (!grown) { free(u); errno = ENOMEM; return -1; }
+        *lineptr = grown; *n = len + 1;
+    }
+    memcpy(*lineptr, u, len + 1);
+    free(u);
+    return (long long)len;
+}
+
 static inline long long k3_getline(char **lineptr, size_t *n, FILE *stream)
 {
     if (!lineptr || !n || !stream) { errno = EINVAL; return -1; }
@@ -215,6 +269,14 @@ static inline long long k3_getline(char **lineptr, size_t *n, FILE *stream)
         *n = 128;
         *lineptr = (char *)malloc(*n);
         if (!*lineptr) { errno = ENOMEM; return -1; }
+    }
+    if (stream == stdin) {
+        HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD mode;
+        if (in != INVALID_HANDLE_VALUE && GetConsoleMode(in, &mode)) {
+            const long long r = k3_win_console_getline(lineptr, n, in);
+            if (r != -2) return r;
+        }
     }
     size_t len = 0;
     int c;
@@ -249,8 +311,13 @@ static inline long long k3_getline(char **lineptr, size_t *n, FILE *stream)
  * the same durability the fsync above bought for the data. */
 static inline int k3_win_rename(const char *from, const char *to)
 {
-    if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
-    switch (GetLastError()) {
+    wchar_t *wf = k3_win_widen(from), *wt = k3_win_widen(to);
+    const BOOL ok = wf && wt &&
+        MoveFileExW(wf, wt, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    const DWORD err = (wf && wt) ? GetLastError() : ERROR_NOT_ENOUGH_MEMORY;
+    free(wf); free(wt);
+    if (ok) return 0;
+    switch (err) {
     case ERROR_FILE_NOT_FOUND: case ERROR_PATH_NOT_FOUND: errno = ENOENT; break;
     case ERROR_ACCESS_DENIED:  case ERROR_SHARING_VIOLATION: errno = EACCES; break;
     default: errno = EIO; break;
@@ -269,7 +336,11 @@ static inline int k3_win_rename(const char *from, const char *to)
 static inline int k3_win_mkdir(const char *path, int mode)
 {
     (void)mode;
-    return _mkdir(path);
+    wchar_t *wp = k3_win_widen(path);
+    if (!wp) { errno = ENOMEM; return -1; }
+    const int r = _wmkdir(wp);
+    free(wp);
+    return r;
 }
 #define mkdir(path, mode) k3_win_mkdir((path), (mode))
 

@@ -15,7 +15,15 @@
  *     - Vista-and-later kernel32 calls: GlobalMemoryStatusEx, K32GetProcessMemoryInfo,
  *       the condition-variable API, GetLogicalProcessorInformation
  *   The kernel32 ones are looked up at run time with GetProcAddress, so the binary needs
- *   no import library and runs on any Windows from Vista on. */
+ *   no import library and runs on any Windows from Vista on.
+ *
+ * TEXT IS UTF-8 EVERYWHERE, as on Linux. Windows hands a C program its command line and
+ * takes file names in the active ANSI code page, which cannot hold most of Unicode, so a
+ * Chinese prompt or a model directory under a non-Latin user name arrived mangled. The
+ * section "UTF-8 on Windows" below converts the command line to UTF-8 at the start of
+ * main (k3_win_utf8_main), switches the console to UTF-8 for the run, and routes fopen,
+ * open, opendir, rename, unlink, mkdir and mkstemp through the wide-character APIs, so
+ * every path the engine handles is UTF-8 on both platforms. */
 #ifndef K3_WIN32_H
 #define K3_WIN32_H
 #ifdef _WIN32
@@ -29,6 +37,8 @@
 #include <fcntl.h>
 #include <io.h>
 #include <time.h>
+#include <wchar.h>
+#include <direct.h>
 
 /* TCC 0.9.27's 64-bit Windows math.h defines fabsf and fabsl with x87 inline assembly
  * ("=t" constraint) that TCC itself cannot compile, so any call to them fails to build.
@@ -126,6 +136,107 @@ unsigned __int64 __cdecl _strtoui64(const char *, char **, int);
 void *__cdecl _aligned_malloc(size_t size, size_t alignment);
 void  __cdecl _aligned_free(void *p);
 
+/* ------------------------------------------------------------ UTF-8 on Windows -- */
+/* UTF-8 to a freshly allocated UTF-16 string, or NULL. A string that is not valid UTF-8
+ * is taken as the ANSI code page instead, so a name that reached here by some other
+ * route (an environment variable, say) still opens. Free with free(). */
+static wchar_t *k3_win_widen(const char *s)
+{
+    if (!s) return NULL;
+    UINT cp = CP_UTF8;
+    int n = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, s, -1, NULL, 0);
+    if (n <= 0) { cp = CP_ACP; n = MultiByteToWideChar(cp, 0, s, -1, NULL, 0); }
+    if (n <= 0) return NULL;
+    wchar_t *w = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
+    if (!w) return NULL;
+    if (MultiByteToWideChar(cp, cp == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0, s, -1, w, n) <= 0) {
+        free(w);
+        return NULL;
+    }
+    return w;
+}
+
+/* UTF-16 to a freshly allocated UTF-8 string, or NULL. Free with free(). */
+static char *k3_win_narrow(const wchar_t *w)
+{
+    if (!w) return NULL;
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (n <= 0) return NULL;
+    char *s = (char *)malloc((size_t)n);
+    if (!s) return NULL;
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, s, n, NULL, NULL) <= 0) { free(s); return NULL; }
+    return s;
+}
+
+static FILE *k3_win_fopen(const char *path, const char *mode)
+{
+    wchar_t *wp = k3_win_widen(path), *wm = k3_win_widen(mode);
+    FILE *f = (wp && wm) ? _wfopen(wp, wm) : NULL;
+    if (!wp || !wm) errno = ENOMEM;
+    free(wp); free(wm);
+    return f;
+}
+#define fopen(path, mode) k3_win_fopen((path), (mode))
+
+static int k3_win_unlink(const char *path)
+{
+    wchar_t *wp = k3_win_widen(path);
+    if (!wp) { errno = ENOMEM; return -1; }
+    const int r = _wunlink(wp);
+    free(wp);
+    return r;
+}
+#define unlink(path) k3_win_unlink(path)
+
+/* The console's code pages as they were before this process changed them; a console
+ * keeps its code page after the program exits, so they are put back at exit. */
+static UINT k3_win_saved_out_cp, k3_win_saved_in_cp;
+static void k3_win_restore_console(void)
+{
+    if (k3_win_saved_out_cp) SetConsoleOutputCP(k3_win_saved_out_cp);
+    if (k3_win_saved_in_cp)  SetConsoleCP(k3_win_saved_in_cp);
+}
+
+/* Call first thing in main. Replaces argc/argv with the UTF-8 form of the real (UTF-16)
+ * command line, and puts an attached console into UTF-8 for this run, so prompts typed
+ * or passed in any language arrive intact and generated text prints as itself. On any
+ * failure argv is left as the C runtime built it, which is the old behaviour. The
+ * converted strings live for the whole process, like the originals. */
+typedef LPWSTR *(WINAPI *K3CommandLineToArgvW)(LPCWSTR, int *);
+static void k3_win_utf8_main(int *argc, char ***argv)
+{
+    if (GetConsoleOutputCP() != CP_UTF8) {
+        const UINT out = GetConsoleOutputCP(), in = GetConsoleCP();
+        if (out && SetConsoleOutputCP(CP_UTF8)) {
+            k3_win_saved_out_cp = out;
+            if (in && SetConsoleCP(CP_UTF8)) k3_win_saved_in_cp = in;
+            atexit(k3_win_restore_console);
+        }
+    }
+
+    HMODULE shell32 = LoadLibraryA("shell32.dll");
+    K3CommandLineToArgvW split = shell32
+        ? (K3CommandLineToArgvW)(void *)GetProcAddress(shell32, "CommandLineToArgvW") : NULL;
+    if (!split) return;
+    int n = 0;
+    LPWSTR *wargv = split(GetCommandLineW(), &n);
+    if (!wargv || n <= 0) return;
+    char **out = (char **)calloc((size_t)n + 1, sizeof(char *));
+    if (!out) { LocalFree(wargv); return; }
+    for (int i = 0; i < n; i++) {
+        out[i] = k3_win_narrow(wargv[i]);
+        if (!out[i]) {                           /* keep the runtime's argv instead */
+            for (int j = 0; j < i; j++) free(out[j]);
+            free(out);
+            LocalFree(wargv);
+            return;
+        }
+    }
+    LocalFree(wargv);
+    *argc = n;
+    *argv = out;
+}
+
 /* ------------------------------------------------------------------ mkstemp -- */
 /* Replace the trailing XXXXXX of `tmpl` and create the file exclusively, as POSIX
  * mkstemp does. Returns a descriptor opened read/write in binary mode, or -1. */
@@ -143,7 +254,10 @@ static int k3_win_mkstemp(char *tmpl)
             seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
             tmpl[n - 6 + i] = alnum[(seed >> 33) % (sizeof alnum - 1)];
         }
-        const int fd = _open(tmpl, _O_RDWR | _O_CREAT | _O_EXCL | _O_BINARY, 0600);
+        wchar_t *wt = k3_win_widen(tmpl);
+        if (!wt) { errno = ENOMEM; return -1; }
+        const int fd = _wopen(wt, _O_RDWR | _O_CREAT | _O_EXCL | _O_BINARY, 0600);
+        free(wt);
         if (fd >= 0) return fd;
         if (errno != EEXIST) return -1;
     }
