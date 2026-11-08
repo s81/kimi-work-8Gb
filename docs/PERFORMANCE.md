@@ -202,8 +202,13 @@ not as the engine's speed.
 
 ## Reproducing
 
+The figures in this document were measured with the previous GCC `-O3 -march=native`
+AVX2 build. The current build uses the Tiny C Compiler and runs the scalar kernels, which
+are about 14x slower on the compute side (README, *Building*); I/O-bound figures are
+unaffected by the compiler.
+
 ```bash
-make -j
+tcc -run build.c
 ./scripts/k3-doctor.sh ~/k3model          # what this machine should manage
 ./benchmarks/memory-ladder.sh ~/k3model ~/k3trunk out/   # the full sweep
 ```

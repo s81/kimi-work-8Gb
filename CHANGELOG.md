@@ -5,7 +5,46 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed (this fork): built with the Tiny C Compiler only
+
+- **The build is now `tcc -run build.c`**, one C file run by the Tiny C Compiler on
+  Linux and Windows: `test`, `test-all`, `bench`, `dist` and `clean` are targets of the
+  same file. No make, CMake, GCC, MinGW/MSYS2, shell scripts or Python are needed to
+  build, test or package; `dist` writes the release zip itself. The Makefile, CMake
+  files and `scripts/build-windows.sh` are removed. Compiles use `-Wall -Werror`.
+- **TCC 0.9.28rc, pinned** to TinyCC commit `e23dabed` and built from source with TCC
+  itself (`.github/actions/setup-tcc`). The official 0.9.27 Windows release miscompiles
+  negated float comparisons with NaN (`!(x > 0.0)` as `x <= 0.0`), which breaks the NaN
+  guards; `test_sampler` catches it.
+- **OpenMP is replaced by `src/core/k3_par.c`**, a persistent thread pool with a static
+  and a one-at-a-time parallel-for, covering all eight former `#pragma omp` loops. Output
+  is bit-identical (oracle and op tests at 1 and 4 threads); `--threads` and
+  `OMP_NUM_THREADS` keep their meaning. It scales 3.6-3.9x on 4 cores.
+- **Windows support moved to `src/compat/`** for TCC's msvcrt-based runtime: a pthread
+  layer on native threads and Vista condition variables, `unistd.h`/`dirent.h`, 64-bit
+  `lseek`, `clock_gettime`, `mkstemp`, `fma`, and run-time lookups for Vista-and-later
+  kernel32 calls.
+- **CI and releases** build and test with TCC on `ubuntu-latest` and `windows-latest`,
+  upload both zips on every run, and publish Linux and Windows zips with
+  `SHA256SUMS.txt` on `v*` tags. The macOS, sanitizer and CMake jobs are gone, since
+  none of them can run with TCC.
+
+### Performance
+
+- **About 14x slower on compute.** TCC has no SIMD and optimises little, so the kernels
+  run the scalar paths: bf16 matmul 12288 x 7168 takes 148/166/128 ms against 10.2/10.1/
+  10.8 ms for the old GCC AVX2 build, and MXFP4 3072 x 3584 17.3/19.3/16.8 ms against
+  1.29/0.81/1.31 ms (4-core Xeon, three runs each). The results are bit-identical: both
+  builds print the same output digests. I/O-bound phases are unaffected.
+
 ### Fixed
+
+- **File offsets past 2 GB on Windows.** `(off_t)` casts in the shard and trunk readers,
+  and `lseek` for the file size, are 32-bit in the Windows C runtime and wrapped every
+  offset past 2 GB; offsets are now `int64_t` and `lseek` is `_lseeki64`.
+  `test_model_stream`'s 2^60-offset short-read check found it.
+
+### Fixed (upstream)
 
 - **The trunk report counted a prefetched layer as a hit** whenever its read finished
   before the walk bound it. On a fully streamed run of the tiny checkpoint, every one of

@@ -7,10 +7,10 @@
 <p>Kimi K3 inference in portable C99.<br>No BLAS. No framework. No GPU.</p>
 
 <p>
-<a href="https://github.com/FareedKhan-dev/kimi-k3-in-c/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/FareedKhan-dev/kimi-k3-in-c/ci.yml?branch=main&style=flat-square&label=CI" alt="CI"></a>
+<a href="https://github.com/s81/kimi-work-8Gb/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/s81/kimi-work-8Gb/ci.yml?branch=main&style=flat-square&label=CI" alt="CI"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="License"></a>
-<a href="Makefile"><img src="https://img.shields.io/badge/C99-portable-lightgrey?style=flat-square" alt="C99"></a>
-<a href="#requirements"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square" alt="Platform"></a>
+<a href="build.c"><img src="https://img.shields.io/badge/build-Tiny%20C%20Compiler-lightgrey?style=flat-square" alt="Built with TCC"></a>
+<a href="#requirements"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey?style=flat-square" alt="Platform"></a>
 <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.1.0-brightgreen?style=flat-square" alt="Version"></a>
 </p>
 
@@ -230,12 +230,46 @@ The gate is storage: **the checkpoint is 1.56 TB.** Everything else is ordinary.
 
 | | | |
 |---|---|---|
-| **OS** | Linux, x86-64 (reference); macOS/arm64 and Windows/x86-64 also build and pass every gate | uses `O_DIRECT`, `posix_memalign`, `getrusage` -- ported for Windows via MSYS2's MinGW-w64 (see `src/io/k3_portable_io.h`) |
-| **CPU** | AVX2 + FMA on x86-64, NEON on arm64 | AVX-512 unnecessary. `make portable` targets generic AVX2 on x86-64 |
+| **OS** | Linux and Windows, x86-64 | both build with the same `build.c` and pass every gate; Windows needs Vista or later (see `src/compat/k3_win32.h`) |
+| **CPU** | any x86-64 | the TCC build runs the scalar kernels on every CPU; there are no SIMD requirements |
 | **RAM** | 8 GB and up | every preset works; more memory is faster, never different |
 | **Storage** | ~1.7 TB free | 1.56 TB checkpoint + 109 GB packed trunk, ideally on fast local disk |
-| **Toolchain** | GCC ≥ 9 or Clang ≥ 10 | GNU make, or CMake |
-| **Python** | 3.9+ | for the download, pack and analysis tools; not for `make test` |
+| **Toolchain** | the Tiny C Compiler (TCC) 0.9.28rc | nothing else: no make, no shell, no Python. See [Building](#building) for the pinned version and why 0.9.27 is not enough |
+| **Python** | 3.9+, optional | only for the download, pack and analysis tools; never for building or testing |
+
+### Building
+
+The whole build is one C file, [`build.c`](build.c), run by TCC:
+
+```bash
+tcc -run build.c          # builds bin/k3 (bin\k3.exe on Windows)
+tcc -run build.c test     # builds and runs every test that needs no weights
+tcc -run build.c dist     # packages dist/k3-<version>-<os>-x64.zip
+```
+
+The same command works on Linux and Windows. Use TCC **0.9.28rc** built from
+[TinyCC's source](https://repo.or.cz/tinycc.git) at commit `e23dabed` (2026-10-16); CI
+builds exactly that with
+[`.github/actions/setup-tcc`](.github/actions/setup-tcc/action.yml), bootstrapped from
+TCC itself. The official 0.9.27 Windows release is **not** sufficient: it miscompiles
+negated floating-point comparisons with NaN (`!(x > 0.0)` behaves as `x <= 0.0`), which
+breaks the engine's NaN guards, and the test suite catches it.
+
+**Speed.** TCC does almost no optimisation and has no SIMD, so the kernels run the
+scalar paths at roughly a fourteenth of the old GCC `-O3 -march=native` AVX2 build's
+speed. Measured on a 4-core Xeon, three runs each, at real Kimi K3 dimensions:
+
+| kernel | GCC AVX2 (previous build) | TCC (this build) |
+|---|---|---|
+| bf16 matmul 12288 x 7168 | 10.15 / 10.05 / 10.82 ms | 148.4 / 165.7 / 127.9 ms |
+| MXFP4 matmul 3072 x 3584 | 1.29 / 0.81 / 1.31 ms | 17.32 / 19.27 / 16.81 ms |
+
+The **results are bit-identical**: both builds print the same output digests, because the
+scalar and AVX2 kernels share one summation order by design. The thread pool
+([`src/core/k3_par.h`](src/core/k3_par.h)) replaces OpenMP and scales 3.6-3.9x on those 4
+cores. The measured time-per-token figures elsewhere in this README come from the GCC build
+and are not what this build achieves; compute-bound runs are slower by about the ratio
+above.
 
 The tokenizer and config reader are portable C99 and build anywhere. Without a checkpoint
 you can still do everything in [Quick start](#quick-start).
@@ -246,11 +280,10 @@ Clone, build and run the entire test suite. **No checkpoint, no network, no Pyth
 whole thing takes about a minute.
 
 ```bash
-git clone https://github.com/FareedKhan-dev/kimi-k3-in-c.git
-cd kimi-k3-in-c
+git clone https://github.com/s81/kimi-work-8Gb.git
+cd kimi-work-8Gb
 
-make -j            # seconds. Seven C files, a compiler and OpenMP
-make test          # under a minute
+tcc -run build.c test    # builds everything and runs every weightless test
 ```
 
 It ends like this, or it failed:
@@ -291,8 +324,8 @@ to a preset, measures your storage, and prints the exact command to run next.
 ### Step 0. clone
 
 ```bash
-git clone https://github.com/FareedKhan-dev/kimi-k3-in-c.git
-cd kimi-k3-in-c
+git clone https://github.com/s81/kimi-work-8Gb.git
+cd kimi-work-8Gb
 ```
 
 About 45 MB, most of it the diagrams and the test fixtures.
@@ -309,19 +342,15 @@ non-zero if the machine cannot run the model at all.
 ### Step 2. build
 
 ```bash
-make -j
+tcc -run build.c
 ```
 
-Seconds. The only dependencies are a C99 compiler, libm and OpenMP. CMake works too:
-
-```bash
-cmake -B build && cmake --build build -j && ctest --test-dir build
-```
+Seconds. The only dependency is the Tiny C Compiler; see [Building](#building).
 
 ### Step 3. verify before downloading anything
 
 ```bash
-make test
+tcc -run build.c test
 ```
 
 This is worth doing before committing to a 1.56 TB download: it proves the engine matches
@@ -435,7 +464,7 @@ printf 'La capitale de la France est' > /tmp/p.txt
 | `--trunk-gb` | `X` | 16 | budget for pinned layers plus the streaming ring |
 | `--cache-gb` | `X` | 64 | budget for the routed-expert LRU cache |
 | `--trunk-ring` | `N` | 2 | streaming ring slots: one layer being computed on, the rest reads in flight. Each extra slot costs one slot of RAM, and the budget still wins if it does not fit |
-| `--threads` | `N` | physical cores | OpenMP threads. On Linux the default is the physical core count rather than OpenMP's one thread per logical CPU, which is slower here on SMT parts. `OMP_NUM_THREADS`, if set, is respected |
+| `--threads` | `N` | physical cores | worker threads (the `k3_par` pool). The default is the physical core count rather than one thread per logical CPU, which is slower here on SMT parts. `OMP_NUM_THREADS`, if set, is respected |
 | `--ultra-low-memory` | none | off | stream exact embedding rows and lm_head chunks; full recompute also reuses one recurrent-state slot. Requires `--trunk` |
 
 The `ultra` preset selects `--ultra-low-memory` with a 2.5 GB trunk ring and a
@@ -682,7 +711,7 @@ times slower than local NVMe; keep `~/k3trunk` local.
 regardless of budget, and the engine computes that up front rather than discovering it an
 hour in. Shorten the request, or drop `--incremental`, which carries no KV cache at all.
 
-**Is the whole 1.56 TB needed?** For generation, yes. For development, no: `make test`
+**Is the whole 1.56 TB needed?** For generation, yes. For development, no: `tcc -run build.c test`
 needs nothing at all, and `--layers N` runs against partial shard sets.
 `scripts/download-model.sh <dest> --layers N` fetches only the shards those layers need,
 about 7 GB for `N=1` and 125 GB for `N=8`. That is for exercising the pipeline on a small
@@ -700,23 +729,19 @@ It also keeps the build free of a dependency that installs differently on each
 platform, for kernels that are not the bottleneck anyway. A run is limited by how fast
 the trunk and the experts come off disk, not by arithmetic.
 
-**macOS, Windows, WSL?** Linux is the reference platform. macOS/arm64 builds with plain
-`make` (see the Makefile's platform block). Windows builds natively too, via MSYS2's
-MinGW-w64 GCC (`pacman -S mingw-w64-x86_64-gcc`, then open the "MSYS2 MinGW x64" shell
-specifically -- `make`, `make test`, and `make test-all` all pass every gate unmodified,
-including the full-model oracle and tokenizer parity against real Kimi K3 weights.
-Four Linux-only calls needed porting -- `O_DIRECT`, `pread`, `posix_memalign`, and
-`getrusage` -- documented in `src/io/k3_portable_io.h`. One real bug surfaced during the
-port and is worth knowing if you extend this code on Windows: `_aligned_malloc`, which
-backs the `posix_memalign` shim, must be freed with `_aligned_free`, not plain `free`;
-POSIX's `posix_memalign` carries no such restriction, so this is easy to get wrong
-silently -- it compiles, and Windows terminates the process with `STATUS_HEAP_CORRUPTION`
-only once the corrupted allocator metadata is actually used. `make asan`/`make ubsan`
-switch to Clang on Windows (`pacman -S mingw-w64-clang-x86_64-clang
-mingw-w64-clang-x86_64-compiler-rt`): MinGW-w64's GCC package ships no sanitizer runtime
-at all, confirmed directly rather than assumed. WSL works too, unmodified, since it is
-just Linux -- the tokenizer and config reader are portable C99 either way and build
-anywhere, in CI included.
+**Windows, Linux, WSL, macOS?** Linux and Windows build from the same `build.c` with the
+same TCC and pass the same gates; CI runs both. Windows support lives in
+`src/compat/`: TCC links against `msvcrt.dll` and an XP-era `kernel32` import list, so
+`src/compat/k3_win32.h` supplies what those lack (64-bit `lseek`, `clock_gettime`,
+`mkstemp`, `fma`, and Vista-and-later calls looked up at run time), and
+`src/compat/win32/` holds small `pthread.h`, `unistd.h` and `dirent.h` headers on native
+Windows primitives. Two porting traps are worth knowing if you extend the code:
+`_aligned_malloc`, which backs the `posix_memalign` shim, must be freed with
+`_aligned_free`, not `free` (Windows otherwise terminates the process with
+`STATUS_HEAP_CORRUPTION` later); and `off_t` is 32-bit in the Windows C runtime, so file
+offsets are always held in `int64_t` -- an `(off_t)` cast silently wraps every offset past
+2 GB, which `test_model_stream` catches. WSL is just Linux. macOS is not currently built or
+tested.
 
 ---
 
@@ -870,8 +895,9 @@ smaller than it is, which is the worst direction to be wrong in.
 
 ## The codebase
 
-Six C files compiled into one binary. No BLAS, no PyTorch, no ONNX runtime, no GPU
-library. The only dependencies are libm and OpenMP.
+A dozen C files compiled into one binary by `build.c`. No BLAS, no PyTorch, no ONNX runtime, no GPU
+library. The only dependencies are the C library and libm; threads come from
+`src/core/k3_par.c`.
 
 ```
 include/k3/
@@ -879,6 +905,7 @@ include/k3/
   k3_cfg.h          # config reader, header-only, refuses to substitute defaults
 src/
   core/k3_ops.c     # every numeric kernel: RMSNorm, KDA, MLA, MoE, MXFP4 matmul
+  core/k3_par.c     # the thread pool and parallel-for that replace OpenMP
   io/k3_st.c        # safetensors reader, hand-written JSON scan, O_DIRECT reads
   io/k3_load.c      # locating one expert's bytes inside a shard
   io/k3_trunk.c     # streaming the dense trunk, pinned prefix plus a ring slot
@@ -886,22 +913,22 @@ src/
   model/k3_bind.c   # binding checkpoint tensor names to kernel arguments
   tokenizer/k3_tok.h# byte-level BPE loaded from tiktoken.model
   cli/k3_run.c      # the k3 binary: memory plan, decode loop, reporting
+  compat/           # Windows: what TCC's msvcrt-based runtime lacks (pthreads, etc.)
+build.c             # the build: tcc -run build.c [test|bench|dist|clean]
 tools/              # python: pack the trunk, replay the cache, verify against torch
 benchmarks/         # the cgroup memory ladder and the split sweep
 tests/              # fixtures, the tiny oracle, the 93-layer conformance run
 ```
 
 ```bash
-CFLAGS = -O3 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla \
-         -march=native -fopenmp -ffp-contract=off
-LDFLAGS = -lm -fopenmp
+tcc -Wall -Werror <includes> <sources> -o bin/k3 -lm -lpthread    # what build.c runs
 ```
 
-The flag that looks unusual is `-ffp-contract=off`. By default a compiler may fuse a
-multiply and an add into a single FMA, which changes the rounding. That is normally good.
-Here it is a problem, because the scalar path, the OpenMP path and the AVX2 path must
-produce **bit-identical** results, so that a performance change can never quietly become
-an accuracy change.
+The original GCC build also passed `-ffp-contract=off`, because by default a compiler may
+fuse a multiply and an add into a single FMA, which changes the rounding. TCC never fuses,
+so the property holds by construction: the scalar path, the threaded path and the
+(dormant, GCC-only) AVX2 path produce **bit-identical** results, so that a performance
+change can never quietly become an accuracy change.
 
 ![One C file plus small headers becomes a tiny static binary](docs/images/build-flow.png)
 
@@ -3515,14 +3542,14 @@ model itself.
 ## Development
 
 ```bash
-make test        # the gate that stays green, no weights, no network, no Python
-make help        # the documented targets
-make asan        # AddressSanitizer and UBSan
-make portable    # generic AVX2, without -march=native
+tcc -run build.c test       # the gate that stays green, no weights, no network, no Python
+tcc -run build.c bench      # kernel microbenchmarks
+tcc -run build.c dist       # the release zip for this platform
+tcc -run build.c help       # the targets
 ```
 
-CI runs the same gates: a GCC and Clang matrix under `-Werror`, sanitizers over the parsers
-and the cache, the full weightless suite, and ruff and shellcheck as blocking checks.
+CI runs the same gates: the full weightless suite under TCC with `-Werror` on Linux and
+Windows, and ruff and shellcheck over the optional tools and scripts as blocking checks.
 Fixtures are generated from the PyTorch reference and committed;
 [`tests/fixtures/README.md`](tests/fixtures/README.md) records what makes each one
 adversarial and how to regenerate it. [`CONTRIBUTING.md`](CONTRIBUTING.md) is the place to

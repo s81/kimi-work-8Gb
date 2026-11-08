@@ -1,67 +1,100 @@
-# Building k3 for Windows
+# Building k3 on Windows
 
-This fork adds a packaged Windows build on top of upstream's existing MinGW-w64 port.
-The engine source is unchanged. `k3.exe` is a statically linked x86-64 console program
-that imports only `KERNEL32.dll` and `msvcrt.dll`, so it needs no DLLs and no installer.
+k3 builds on Windows with the **Tiny C Compiler (TCC)** and nothing else: no MSYS2,
+no MinGW, no Visual Studio, no make, no shell scripts, no Python. The same `build.c`
+that builds on Linux builds on Windows:
+
+```bat
+tcc -run build.c          :: builds bin\k3.exe
+tcc -run build.c test     :: builds and runs every test that needs no model weights
+tcc -run build.c dist     :: packages dist\k3-<version>-windows-x64.zip
+```
+
+`k3.exe` imports only `kernel32.dll` and `msvcrt.dll`, which ship with every version of
+Windows, so it needs no installer or extra DLLs. Windows Vista or later is required
+(the engine uses Vista's condition variables).
 
 ## Download a prebuilt binary
 
-- **Every push / PR:** open the run in the repository's **Actions** tab, workflow
-  **windows-build**, and download the `k3-windows-x64` artifact.
-- **Tagged releases (`v*`):** the zips are attached to the GitHub Release.
+- **Every push and pull request:** the repository's **Actions** tab, workflow **CI**,
+  artifact `k3-Windows-x64`.
+- **Tagged releases (`v*`):** attached to the GitHub Release, with `SHA256SUMS.txt`.
 
-| Zip | CPU requirement | Notes |
-|---|---|---|
-| `k3-<ver>-windows-x64-avx2.zip` | AVX2 + FMA (Intel Haswell 2013+, any AMD Ryzen) | Use this one. Same flags as `make portable`. |
-| `k3-<ver>-windows-x64-generic.zip` | Any 64-bit x86 CPU | Scalar kernels, slower. Only use it if the avx2 build fails with `0xC000001D` (illegal instruction). |
+Check a download in PowerShell:
 
 ```powershell
+Get-FileHash .\k3-1.1.0-windows-x64.zip -Algorithm SHA256   # compare with SHA256SUMS.txt
 .\k3.exe --help
-.\k3.exe --list-presets
 ```
 
-To run the model you have to download the Kimi K3 weights separately (hundreds of GB).
-See `README.md` and `docs/QUICKSTART.md`. Pass non-ASCII prompts with `--prompt-file`,
-because Windows re-encodes argv to the active code page.
+Running the model needs the Kimi K3 weights, downloaded separately (about 1.56 TB). Pass
+non-ASCII prompts with `--prompt-file`, because Windows re-encodes argv to the active
+code page.
 
-## Build it yourself
+## Get the right TCC
 
-### Option A: native, MSYS2 (Windows)
+Use **TCC 0.9.28rc** built from TinyCC's source at commit `e23dabed` (2026-10-16). The
+official 0.9.27 Windows download is **not** enough on its own: it miscompiles negated
+floating-point comparisons with NaN (`!(x > 0.0)` behaves as `x <= 0.0`), which breaks the
+engine's NaN guards. `tcc -run build.c test` catches it (test_sampler, "NaN temperature is
+rejected").
 
-1. Install [MSYS2](https://www.msys2.org/), then open the **"MSYS2 MinGW x64"** shell.
-   Don't use the plain "MSYS2 MSYS" shell.
-2. Install the toolchain:
-   ```bash
-   pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp make zip git
-   ```
-3. Build and package:
-   ```bash
-   ./scripts/build-windows.sh        # writes dist/*.zip
-   ```
-   For a binary tuned to *your own* CPU only, plain `make` uses `-march=native` and
-   writes `bin/k3.exe`.
-4. Optional: run the weightless test suite with `make test`.
+0.9.27 can build 0.9.28rc, so the toolchain is TCC all the way down. In a Command
+Prompt, with `git` available:
 
-### Option B: cross-compile from Linux or WSL
+```bat
+:: 1. the official 0.9.27 release as the bootstrap compiler
+::    https://download.savannah.gnu.org/releases/tinycc/tcc-0.9.27-win64-bin.zip
+::    SHA-256 34a721949a2583fdff725312da092fa0f5f1f284b702e6f811c6954714faabb2
+::    unzip it to C:\tcc-boot
 
-```bash
-sudo apt-get install gcc-mingw-w64-x86-64-posix make zip
-./scripts/build-windows.sh
+:: 2. the pinned source
+git clone https://repo.or.cz/tinycc.git C:\tinycc
+git -C C:\tinycc checkout e23dabed154a8495f3ac1ff3cc9d04fa1c207893
+
+:: 3. 0.9.27's kernel32 import list is too old for the new TCC; give it the new lists
+copy /y C:\tinycc\win32\lib\*.def C:\tcc-boot\tcc\lib\
+
+:: 4. TinyCC's own build script, compiling TCC with TCC
+cd C:\tinycc\win32
+build-tcc.bat -c C:\tcc-boot\tcc\tcc.exe -t x86_64
+set PATH=C:\tinycc\win32;%PATH%
+tcc -v
 ```
 
-Use the `-posix` threads flavour. The engine needs pthreads and OpenMP, and the
-`-win32` flavour has neither.
+`C:\tinycc\win32` then holds a self-contained toolchain (`tcc.exe`, `libtcc.dll`,
+`lib\`, `include\`). CI does exactly this in
+[`.github/actions/setup-tcc`](../.github/actions/setup-tcc/action.yml).
 
-## How this was verified
+If `tcc` is not on `PATH`, tell `build.c` where it is: `set CC=C:\tinycc\win32\tcc.exe`.
 
-- The Linux cross-compile (MinGW-w64 GCC 13.2, posix) builds both variants with **zero
-  warnings** under the project's `-Wall -Wextra -Wshadow -Wpointer-arith -Wvla`.
-- `objdump -p k3.exe` shows only `KERNEL32.dll` and `msvcrt.dll` as imports.
-- The full `make test` suite passed with the cross-compiled AVX2 `.exe` files run
-  under Wine: `22 passed, 0 failed, 0 skipped`, `VERDICT: ENGINE MATCHES THE REFERENCE
-  EXACTLY`, `ALL WEIGHTLESS TESTS PASSED`. Two subtests skip themselves by design on
-  Windows (no inode or `fork`). Tokenizer parity did not run because it needs the
-  real model's `tiktoken.model`, and upstream CI skips it for the same reason.
-- CI repeats the build and test natively on `windows-latest`.
-- Not verified: inference on real Kimi K3 weights on Windows. That needs the
-  checkpoint, which this build did not have.
+## What the Windows port needs
+
+TCC on Windows links against `msvcrt.dll` and an XP-era `kernel32` import list.
+`build.c` therefore force-includes `src/compat/k3_win32.h` and puts `src/compat/win32/`
+on the include path for Windows builds:
+
+| Gap | Filled by |
+|---|---|
+| `pthread.h` | `src/compat/win32/pthread.h`: threads, critical sections, Vista condition variables |
+| `unistd.h`, `dirent.h` | small headers in `src/compat/win32/` on msvcrt and `FindFirstFileA` |
+| 32-bit `off_t`/`lseek` | `_lseeki64`; offsets are held in `int64_t`, never `off_t` (a cast would wrap past 2 GB) |
+| `clock_gettime`, `mkstemp` | `QueryPerformanceCounter`, an exclusive-create loop |
+| `fma`, `expf`, `sqrtf`, `tanhf` | double-precision equivalents; `fma` is exact only because every call site multiplies float-derived values |
+| `GlobalMemoryStatusEx`, `K32GetProcessMemoryInfo`, condition variables, `GetLogicalProcessorInformation` | looked up at run time with `GetProcAddress` |
+| `fabsf`/`fabsl` in TCC's `math.h` | replaced: TCC 0.9.27's header uses x87 assembly TCC cannot compile |
+
+## Speed
+
+TCC builds run the scalar kernels without SIMD and with little optimisation: about 14x
+slower than the old GCC `-O3` AVX2 build on the compute side, with bit-identical output.
+See the README's *Building* section for the measurements.
+
+## Verified
+
+- `tcc -run build.c test` passes in full with TCC 0.9.28rc on Windows (here under Wine,
+  and natively in CI on `windows-latest`): `22 passed, 0 failed, 0 skipped`, `VERDICT:
+  ENGINE MATCHES THE REFERENCE EXACTLY`, `ALL WEIGHTLESS TESTS PASSED`. Two subtests skip
+  themselves by design on Windows (no inodes, no `fork`).
+- Not verified: inference on real Kimi K3 weights on Windows, and tokenizer parity; both
+  need the checkpoint.

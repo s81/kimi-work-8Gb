@@ -137,7 +137,8 @@ if (k3_expert_drops) {
 
 ## Thread safety
 
-The kernels are reentrant and parallelise internally with OpenMP. They hold no global
+The kernels are reentrant and parallelise internally with the `k3_par` thread pool
+(`src/core/k3_par.h`). They hold no global
 state except `k3_expert_drops`.
 
 The cache, the trunk reader, and the safetensors index are **not** thread-safe. One

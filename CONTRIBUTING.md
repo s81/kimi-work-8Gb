@@ -6,10 +6,10 @@ Real fixes and features from outside the project are credited in
 ## Before anything
 
 ```bash
-make -j && make test
+tcc -run build.c test
 ```
 
-`make test` needs no model weights and must stay green. If it is red on `main`, that is
+That needs only the Tiny C Compiler (see the README's *Building* section), and it no model weights and must stay green. If it is red on `main`, that is
 the bug worth fixing first.
 
 `tools/*.py` (fixture generation, reference conformance, cache replay) needs `numpy`,
@@ -51,19 +51,24 @@ claim. See [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 
 ## Style
 
-- C99, 4-space indent, 90 columns. `make format` if you have clang-format.
-- Warnings are errors in CI. In particular `-Wpointer-arith` is deliberate: weight
-  pointers are `const void *`, and arithmetic on void strides by one byte under GCC
-  silently returning the wrong tensor.
-- Keep `-ffp-contract=off`. The op tests compare against a reference at a fixed
-  tolerance; letting the compiler fuse multiply-adds moves results past it.
+- C99, 4-space indent, 90 columns. `clang-format -i` with `.clang-format` if you have it.
+- Warnings are errors: `build.c` compiles with `-Wall -Werror`.
+- **Never do arithmetic on a `void *`.** Weight pointers are `const void *`, and
+  arithmetic on void strides by one byte, silently returning the wrong tensor. GCC's
+  `-Wpointer-arith` used to reject it; TCC accepts it without a warning, so review is
+  now the first line of defence (the oracle tests are the second). Cast to the element
+  type first.
+- Do not fuse multiply-adds by hand or rely on `fma()` for general doubles. TCC never
+  contracts `a*b+c`, which keeps the scalar results bit-exact; on Windows `fma()` is
+  defined as `a*b+c` (see `src/compat/k3_win32.h`), which is only exact because every
+  call site multiplies float-derived values.
 
 ## Adding a kernel
 
 1. Generate a fixture with `tools/emit_fixtures.py`, including its tolerance.
 2. Add the case to `tests/unit/test_ops.c`.
 3. Verify against the reference implementation in `tools/k3_ref.py`.
-4. Check it still holds on a real layer: `make test-all SHARD_DIR=...`.
+4. Check it still holds on a real layer: `SHARD_DIR=... tcc -run build.c test-all`.
 
 ## Commits and PRs
 

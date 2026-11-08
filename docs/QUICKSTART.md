@@ -15,16 +15,16 @@ fast its storage is. Storage matters more than you would expect, the engine move
 ## 2. Build
 
 ```bash
-make -j
+tcc -run build.c
 ```
 
-No dependencies beyond a C compiler and OpenMP. If `-march=native` is a problem (you are
-building for a different machine), use `make portable`.
+No dependencies beyond the Tiny C Compiler (TCC 0.9.28rc; see the README's *Building*
+section). The binary runs on any x86-64 CPU.
 
 ## 3. Verify
 
 ```bash
-make test
+tcc -run build.c test
 ```
 
 Seconds, and **no model weights required**. Op kernels, the streaming cache, the
