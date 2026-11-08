@@ -61,7 +61,5 @@ venv/
 !tests/fixtures/
 !tests/fixtures/**
 
-# Windows build outputs (scripts/build-windows.sh)
-build-win*/
-bin-win*/
+# Release zips (tcc -run build.c dist)
 /dist/

@@ -1,0 +1,73 @@
+name: Set up the pinned Tiny C Compiler
+description: >
+  Builds TCC 0.9.28rc from TinyCC's official source at a pinned commit and puts it on
+  PATH. The bootstrap compiler is itself TCC: the distribution's tcc on Linux, and the
+  official 0.9.27 Windows release on Windows. No GCC, Clang or MSVC is involved.
+
+# Why not use a packaged TCC directly: the official 0.9.27 Windows release miscompiles
+# negated floating-point comparisons with NaN (it treats !(x > 0.0) as x <= 0.0), which
+# breaks the engine's NaN guards; test_sampler's "NaN temperature is rejected" catches
+# it. The pinned 0.9.28rc commit compiles them correctly. Linux uses the same commit so
+# both platforms build with one compiler version.
+
+runs:
+  using: composite
+  steps:
+    # --------------------------------------------------------------- Linux --------
+    - name: Build TCC (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        TINYCC_COMMIT: e23dabed154a8495f3ac1ff3cc9d04fa1c207893   # 2026-10-16, 0.9.28rc
+      run: |
+        set -euo pipefail
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends tcc
+        git clone --quiet https://repo.or.cz/tinycc.git "$RUNNER_TEMP/tinycc"
+        git -C "$RUNNER_TEMP/tinycc" checkout --quiet "$TINYCC_COMMIT"
+        cd "$RUNNER_TEMP/tinycc"
+        ./configure --cc=tcc --prefix="$RUNNER_TEMP/tcc"
+        make -j"$(nproc)"
+        make install
+        echo "$RUNNER_TEMP/tcc/bin" >> "$GITHUB_PATH"
+        "$RUNNER_TEMP/tcc/bin/tcc" -v
+
+    # ------------------------------------------------------------- Windows --------
+    - name: Build TCC (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        TINYCC_COMMIT: e23dabed154a8495f3ac1ff3cc9d04fa1c207893   # 2026-10-16, 0.9.28rc
+        BOOT_URL: https://download.savannah.gnu.org/releases/tinycc/tcc-0.9.27-win64-bin.zip
+        BOOT_SHA256: 34a721949a2583fdff725312da092fa0f5f1f284b702e6f811c6954714faabb2
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $tmp  = $env:RUNNER_TEMP
+        $boot = Join-Path $tmp 'tcc-boot'
+
+        # 1. The official 0.9.27 release, verified, as the bootstrap compiler.
+        $zip = Join-Path $tmp 'tcc-0.9.27-win64-bin.zip'
+        Invoke-WebRequest -Uri $env:BOOT_URL -OutFile $zip
+        $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+        if ($sha -ne $env:BOOT_SHA256) { throw "tcc 0.9.27 download hash $sha does not match $env:BOOT_SHA256" }
+        Expand-Archive $zip -DestinationPath $boot
+
+        # 2. The pinned source.
+        $src = Join-Path $tmp 'tinycc'
+        git clone --quiet https://repo.or.cz/tinycc.git $src
+        git -C $src checkout --quiet $env:TINYCC_COMMIT
+
+        # 3. 0.9.27's kernel32 import list predates calls the new TCC uses
+        #    (AddVectoredExceptionHandler among them); give the bootstrap the new lists.
+        Copy-Item (Join-Path $src 'win32\lib\*.def') (Join-Path $boot 'tcc\lib') -Force
+
+        # 4. TinyCC's own Windows build script, compiling TCC with TCC. The result in
+        #    win32\ is self-contained: tcc.exe, libtcc.dll, lib\ and include\.
+        Push-Location (Join-Path $src 'win32')
+        cmd /c "build-tcc.bat -c `"$boot\tcc\tcc.exe`" -t x86_64"
+        if ($LASTEXITCODE -ne 0) { throw "build-tcc.bat failed ($LASTEXITCODE)" }
+        Pop-Location
+
+        $bin = Join-Path $src 'win32'
+        Add-Content -Path $env:GITHUB_PATH -Value $bin
+        & (Join-Path $bin 'tcc.exe') -v

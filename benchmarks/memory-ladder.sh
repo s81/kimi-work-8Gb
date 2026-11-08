@@ -32,7 +32,7 @@ systemd-run --scope --user -q true 2>/dev/null || {
     echo "Try: loginctl enable-linger \$USER, or run under a full login session."
     exit 1
 }
-[ -x ./bin/k3 ] || { echo "./bin/k3 not built, run 'make -j' first"; exit 1; }
+[ -x ./bin/k3 ] || { echo "./bin/k3 not built, run 'tcc -run build.c' first"; exit 1; }
 [ -d "$MODEL" ] || { echo "no such model dir: $MODEL"; exit 1; }
 [ -d "$TRUNK" ] || { echo "no such trunk dir: $TRUNK, run scripts/pack-trunk.sh"; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required for the summary"; exit 1; }

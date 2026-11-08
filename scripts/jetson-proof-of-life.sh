@@ -22,7 +22,7 @@ esac
     echo "FAIL: $TRUNK is not a packed trunk directory" >&2; exit 2;
 }
 [ -x "$ROOT/bin/k3" ] || {
-    echo "FAIL: $ROOT/bin/k3 is not built; run make first" >&2; exit 2;
+    echo "FAIL: $ROOT/bin/k3 is not built; run 'tcc -run build.c' first" >&2; exit 2;
 }
 
 # Count and byte total catch partial transfers. The marker below is stronger: it is
@@ -128,9 +128,8 @@ fi
 # Serial expert reads avoid seeking sixteen ways across a mechanical HDD. This changes
 # only I/O scheduling; Top-K routing, official weights and arithmetic are untouched.
 export K3_NOPREFETCH=1
+# OMP_NUM_THREADS still sets k3's thread count (src/core/k3_par.h).
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc)}"
-export OMP_PROC_BIND="${OMP_PROC_BIND:-close}"
-export OMP_PLACES="${OMP_PLACES:-cores}"
 
 echo "starting full Kimi K3 proof-of-life"
 echo "  model : $MODEL"

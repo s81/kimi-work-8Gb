@@ -1,0 +1,98 @@
+name: release
+
+# Pushing a tag v* builds k3 with the Tiny C Compiler on Linux and Windows, runs the
+# full weightless test suite on each, packages each with `tcc -run build.c dist`, and
+# publishes a GitHub Release with both zips, SHA256SUMS.txt, and the notes in
+# .github/release-notes/<tag>.md (GitHub-generated notes when that file is missing).
+# Every push and PR already gets the same zips as CI artifacts (ci.yml).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build + test + package (${{ matrix.os }}, tcc)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-tcc
+
+      - name: tcc -run build.c test
+        shell: bash
+        run: |
+          set -o pipefail
+          tcc -run build.c test 2>&1 | tee "$RUNNER_TEMP/test.log"
+          grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY" "$RUNNER_TEMP/test.log"
+          grep -q "ALL WEIGHTLESS TESTS PASSED"                   "$RUNNER_TEMP/test.log"
+
+      - name: tcc -run build.c dist
+        shell: bash
+        run: tcc -run build.c dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k3-${{ runner.os }}-x64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: publish the GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Only the release-notes directory is needed here, not the whole tree.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/release-notes
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: k3-*-x64
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Hand-written notes live at .github/release-notes/<tag>.md. A tag without its own
+      # file falls back to GitHub's generated changelog, so a release is never blank.
+      - name: Pick release notes
+        id: notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          f=".github/release-notes/${TAG}.md"
+          if [ -f "$f" ]; then
+            echo "path=$f" >> "$GITHUB_OUTPUT"
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no $f; using GitHub-generated release notes"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: ${{ steps.notes.outputs.generate == 'true' }}
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
