@@ -204,7 +204,7 @@ static int spec_draft(const int *seq, int T, int cap, int *out)
 }
 
 #ifndef K3_VERSION
-#define K3_VERSION "1.2.1"
+#define K3_VERSION "1.2.2"
 #endif
 
 /* The fraction of available memory a plan is allowed to occupy. The admission check and

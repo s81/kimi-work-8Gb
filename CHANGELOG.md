@@ -5,6 +5,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-11-08
+
+Linux and Windows x86-64 release with chained-accumulator TCC kernels. Release notes:
+[`.github/release-notes/v1.2.2.md`](.github/release-notes/v1.2.2.md).
+
 ### Performance
 
 - **Matmul kernels another 1.3x faster under TCC, KDA recurrence step 2.1x**, output
@@ -385,7 +390,8 @@ First public release.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md).
 
-[Unreleased]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.2...HEAD
+[1.2.2]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/s81/kimi-work-8Gb/releases/tag/v1.2.0
 [1.1.0-win.1]: https://github.com/s81/kimi-work-8Gb/releases/tag/v1.1.0-win.1
