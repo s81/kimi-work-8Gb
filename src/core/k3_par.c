@@ -130,11 +130,13 @@ static void par_run(int n, int chunk, k3_par_fn fn, void *ctx)
  * With exactly one block per thread the calling thread takes the first block at once,
  * while a worker must first be woken. If waking takes longer than the caller's block,
  * the caller finishes and then claims the worker's block too, and the loop runs
- * serially. Waking is slow enough on Windows for this to happen: an MXFP4 matmul got
- * 1.1x from 2 threads under Windows against 1.8x on Linux, from identical machine code.
- * Four blocks per thread let a late worker still take a share, at the cost of a few more
- * claims per loop (one mutex round trip each, against blocks of thousands of
- * multiply-adds). Rows are independent, so the split changes no result. */
+ * serially. Observed with the Windows build under Wine, whose thread wake-up is slow: an
+ * MXFP4 matmul got 1.1x to 1.8x from 2 threads, varying run to run, and 1.9x with this
+ * change. On a real Windows runner (CI) the same matmul scales 1.99x with it; that runner
+ * was not measured cleanly before the change, so no gain is claimed there. Four blocks per
+ * thread let a late worker still take a share, at the cost of a few more claims per loop
+ * (one mutex round trip each, against blocks of thousands of multiply-adds). Rows are
+ * independent, so the split changes no result. */
 #define K3_PAR_BLOCKS 4
 
 void k3_par_for(int n, int serial_max, k3_par_fn fn, void *ctx)

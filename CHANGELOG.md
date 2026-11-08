@@ -14,11 +14,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every safetensors header and the 60 MB model index when a model loads. Numbers are now
   parsed from a copy of the token: same value on every platform, and the whole Windows
   CI job went from about 6.5 minutes to well under one.
-- **Thread pool scaling.** `k3_par_for` handed out one block per thread; when waking a
+- **Thread pool hand-out.** `k3_par_for` handed out one block per thread; when waking a
   worker took longer than the caller's own block, the caller ran the worker's block too
-  and the loop ran serially. On Windows an MXFP4 matmul got 1.1x from 2 threads, from
-  machine code identical to Linux's 1.8x. It now hands out 4 blocks per thread and the
-  Windows build gets 1.9x (measured under Wine on one machine). No result changes.
+  and the loop ran serially. That was seen with the Windows build under Wine (1.1x to
+  1.8x from 2 threads on an MXFP4 matmul, varying run to run); it now hands out 4 blocks
+  per thread and gets 1.9x there. On a real Windows runner the same matmul scales 1.99x
+  from 2 threads after the change; its time did not change measurably (7.33 to 7.15 ms),
+  so real Windows was not suffering from this. No result changes.
+- **Windows runners are slower hardware, not slower code.** Linux and Windows TCC emit
+  the same instructions for the hot loops (2,123 against 2,122 in the bf16 kernel), and
+  even kernels with no threads and no C library calls (KDA step, rmsnorm) run 1.6x to
+  2.4x slower on `windows-latest` than on `ubuntu-latest`. The two builds run the matrix
+  kernels at the same speed on one machine.
 - **Prompts and paths in any language.** `k3.exe` now reads its command line as Unicode
   and converts it to UTF-8, puts the console in UTF-8 for the run (restored at exit),
   reads typed chat input with `ReadConsoleW`, and opens, lists, renames and deletes files
