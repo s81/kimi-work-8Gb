@@ -15,312 +15,48 @@ permissions:
   contents: read
 
 jobs:
-  # Every test in this job runs WITHOUT model weights. That is deliberate: the checkpoint
-  # is 1.56 TB, so correctness has to be verifiable without it or it will not be verified.
+  # The whole build is `tcc -run build.c`: one C file, run by the Tiny C Compiler, on
+  # both platforms. Every test here runs WITHOUT model weights. That is deliberate: the
+  # checkpoint is 1.56 TB, so correctness has to be verifiable without it or it will not
+  # be verified.
   build-and-test:
-    name: build + test (${{ matrix.os }}, ${{ matrix.cc }})
+    name: build + test (${{ matrix.os }}, tcc)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-22.04]
-        cc: [gcc, clang]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install toolchain
+      - uses: ./.github/actions/setup-tcc
+
+      # build.c compiles with -Wall -Werror, so a TCC warning fails this step.
+      - name: tcc -run build.c test
+        shell: bash
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libomp-dev
-          ${{ matrix.cc }} --version
+          set -o pipefail
+          tcc -run build.c test 2>&1 | tee "$RUNNER_TEMP/test.log"
 
-      # -march=native is wrong for CI: the runner's CPU is not the user's. ARCH pins the
-      # documented baseline (AVX2 + FMA) instead. It is passed to `test`, not only to
-      # `all`, because the test binaries are built from the same objects and a mixed
-      # -march=native/-mavx2 tree is neither of the two configurations we ship.
-      - name: Build (portable baseline)
-        run: make CC=${{ matrix.cc }} ARCH="-mavx2 -mfma" -j"$(nproc)"
-
-      # `make test` and not the individual binaries. This is the command the README's
-      # Quick start tells every user to run, so it is the one that has to be green. The
-      # per-binary list this replaced omitted scale_test entirely -- the only gate with a
-      # real memory cost, and the only one that exercises the real 7168-wide dimensions.
-      - name: make test
-        run: make CC=${{ matrix.cc }} ARCH="-mavx2 -mfma" test -j"$(nproc)"
-
-      # The tokenizer leg above reports NOT RUN without a vocabulary, which is correct but
-      # must not be mistaken for coverage. Assert the rest of the suite really ran.
+      # Guard against a suite that passes because it silently ran nothing.
       - name: Assert the suite was not silently empty
+        shell: bash
         run: |
-          make CC=${{ matrix.cc }} ARCH="-mavx2 -mfma" test 2>&1 | tee /tmp/t.log
-          grep -q "22 passed, 0 failed, 0 skipped" /tmp/t.log
-          grep -q "SCALE TEST PASSED"              /tmp/t.log
-          grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY" /tmp/t.log
-          grep -q "ALL WEIGHTLESS TESTS PASSED"    /tmp/t.log
+          grep -q "22 passed, 0 failed, 0 skipped"                 "$RUNNER_TEMP/test.log"
+          grep -q "SCALE TEST PASSED"                              "$RUNNER_TEMP/test.log"
+          grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY"  "$RUNNER_TEMP/test.log"
+          grep -q "ALL WEIGHTLESS TESTS PASSED"                    "$RUNNER_TEMP/test.log"
 
-  # build-and-test-macos (macos-14, Apple Clang) is upstream's macOS job. It is removed in
-  # this fork because GitHub never assigned it a macOS runner here: it was cancelled the
-  # instant it started on every run. Restore it from upstream's ci.yml where macOS
-  # runners are available.
+      # The release zip for this platform, so every run has a downloadable build.
+      - name: tcc -run build.c dist
+        shell: bash
+        run: tcc -run build.c dist
 
-  # A separate job rather than a matrix leg, for the same reason as macOS: the setup
-  # action is MSYS2-specific, and the platform-detection block in the Makefile has a
-  # dedicated Windows branch (matched on the MINGW substring of `uname -s`) that only
-  # this job exercises. `make`, not the individual binaries -- the defect this job
-  # guards against is `make` itself failing on Windows, the same rationale as the
-  # macOS "default flags, platform detection" step.
-  build-and-test-windows:
-    name: build + test (windows-latest, mingw64 gcc)
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
-    steps:
-      - uses: actions/checkout@v7
-
-      # MSYS2's MinGW64 environment, not the POSIX-emulation MSYS one: `cc`/`make` must
-      # resolve to the native-Windows-target toolchain. See README.md's "macOS, Windows,
-      # WSL?" section and src/io/k3_portable_io.h for what O_DIRECT, pread,
-      # posix_memalign and getrusage become on this platform, and why -static and
-      # -lpsapi (which the Makefile's Windows branch adds automatically) are
-      # load-bearing rather than stylistic here.
-      #
-      # mingw-w64-x86_64-libgomp is explicit rather than left to the gcc package to
-      # pull in: MSYS2 lists it as an OPTIONAL dependency of
-      # mingw-w64-x86_64-gcc, not a required one, so a plain install of gcc leaves it
-      # absent. -static needs the static archive specifically, and the link then fails
-      # with "cannot find -lgomp" on a toolchain that otherwise looks complete,
-      # confirmed directly rather than assumed.
-      # The runner image ships MSYS2 at C:\msys64; `release: false` uses that copy instead
-      # of downloading the installer, which has failed with HTTP 504 during MSYS2 outages.
-      # If the preinstalled copy is unusable, fall back to a fresh download.
-      - uses: msys2/setup-msys2@v2
-        id: msys2
-        continue-on-error: true
+      - uses: actions/upload-artifact@v4
         with:
-          msystem: MINGW64
-          update: true
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp make
-          release: false
-      - uses: msys2/setup-msys2@v2
-        if: steps.msys2.outcome == 'failure'
-        with:
-          msystem: MINGW64
-          update: true
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp make
-
-      - name: Build (default flags, platform detection)
-        run: make
-
-      - name: make test
-        run: make test
-
-      - name: Assert the suite was not silently empty
-        run: |
-          make test 2>&1 | tee /tmp/t.log
-          grep -q "22 passed, 0 failed, 0 skipped" /tmp/t.log
-          grep -q "SCALE TEST PASSED"              /tmp/t.log
-          grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY" /tmp/t.log
-          grep -q "ALL WEIGHTLESS TESTS PASSED"    /tmp/t.log
-
-  # Windows sanitizer coverage needs a second MSYS2 environment: MinGW-w64's GCC package
-  # ships no libasan/libubsan runtime at all (confirmed directly -- `-lasan`/`-lubsan`
-  # fail to link, and no such file exists anywhere under /mingw64), unlike its Linux and
-  # macOS counterparts. MSYS2's separate Clang/LLVM environment carries a real one.
-  sanitizers-windows:
-    name: ASan + UBSan (windows-latest, clang)
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
-    steps:
-      - uses: actions/checkout@v7
-      # The runner image ships MSYS2 at C:\msys64; `release: false` uses that copy instead
-      # of downloading the installer, which has failed with HTTP 504 during MSYS2 outages.
-      # If the preinstalled copy is unusable, fall back to a fresh download.
-      - uses: msys2/setup-msys2@v2
-        id: msys2
-        continue-on-error: true
-        with:
-          msystem: CLANG64
-          update: true
-          install: mingw-w64-clang-x86_64-clang mingw-w64-clang-x86_64-compiler-rt make
-          release: false
-      - uses: msys2/setup-msys2@v2
-        if: steps.msys2.outcome == 'failure'
-        with:
-          msystem: CLANG64
-          update: true
-          install: mingw-w64-clang-x86_64-clang mingw-w64-clang-x86_64-compiler-rt make
-
-      # These are dynamic DLLs, not statically linked, and Windows resolves them by
-      # searching the executable's own directory before anything on PATH -- confirmed
-      # directly against a PATH already containing the exact directory these ship in.
-      # libc++.dll is not an obvious dependency of a C99 project; it is pulled in
-      # transitively because libclang_rt.asan_dynamic itself links against it.
-      - name: Build instrumented tests
-        run: |
-          make CC=clang CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" \
-               LDFLAGS="-lm -fsanitize=address,undefined -lpsapi -lwinpthread" ARCH= \
-               bin/test_ops bin/test_cfg bin/test_cache bin/test_st bin/test_st_faults bin/test_sampler bin/test_json bin/k3_model bin/test_prefix
-          cp /clang64/bin/libclang_rt.asan_dynamic-x86_64.dll /clang64/bin/libwinpthread-1.dll /clang64/bin/libc++.dll bin/
-      - name: Run under sanitizers
-        env:
-          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: |
-          ./bin/test_ops.exe tests/fixtures/ops
-          ./bin/test_cfg.exe fixture tests/fixtures/ref_k3.json
-          for f in no_layermap bad_layer_index bad_topk; do
-            ./bin/test_cfg.exe reject "tests/fixtures/cfg/$f.json"
-          done
-          ./bin/test_cache.exe tests/fixtures/cache
-          ./bin/test_st.exe tests/fixtures/st /tmp/idx.json \
-            plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
-          ./bin/test_st_faults.exe tests/fixtures/st /tmp/stfault
-          ./bin/test_json.exe
-          ./bin/test_sampler.exe
-          ./bin/k3_model.exe tests/fixtures
-          ./bin/test_prefix.exe
-
-  # CMakeLists.txt documents itself as staying interchangeable with the Make build, but
-  # nothing in CI ever actually built or ran tests through CMake before this job -- that
-  # claim was unverified. This runs the same weightless oracle test that gates the Make
-  # build through cmake/ctest instead, so a future change cannot silently break the
-  # CMake path without CI noticing.
-  cmake-build-and-test:
-    name: build + test (CMake)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libomp-dev
-      - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
-      - name: Build
-        run: cmake --build build -j
-      - name: ctest
-        run: ctest --test-dir build --output-on-failure
-
-  # Warnings are defects here. The engine does arithmetic on `const void *` weight
-  # pointers, where a missing -Wpointer-arith silently strides by one byte.
-  strict-warnings:
-    name: warnings as errors
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libomp-dev
-      - name: Build with -Werror
-        run: make portable CFLAGS="-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Werror -fopenmp -ffp-contract=off" -j"$(nproc)"
-
-  sanitizers:
-    name: ASan + UBSan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libomp-dev
-      # test_cache and test_st are the two that matter most here. SECURITY.md puts the
-      # safetensors parser and the streaming cache in scope precisely because they read
-      # attacker-influenceable bytes: a hand-written binary parser and an O_DIRECT slot
-      # allocator are where an out-of-bounds read actually lives.
-      #
-      # bench_kernels is here for coverage, not for timing. k3_matmul_mxfp4 was reachable
-      # from no instrumented binary in this job: the MoE only takes its nibble-reading
-      # branch when w->src is a real expert source, and every fixture leaves src NULL and
-      # runs the fp32 path instead, so the one kernel that indexes packed 4-bit weights
-      # against a separate scale array went unchecked. test_expert does exercise it but
-      # needs checkpoint bytes, which CI does not have. bench_kernels reaches it with
-      # synthetic data and no weights, which makes it the only way to get it under ASan
-      # here. It also covers k3_matmul_bf16 at full width; test_ops already checks that
-      # one, but at n=129 rather than 12288x7168.
-      - name: Build instrumented tests
-        run: |
-          make CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" \
-               LDFLAGS="-lm -fsanitize=address,undefined" ARCH= \
-               bin/test_ops bin/test_cfg bin/test_cache bin/test_st bin/test_st_faults bin/test_sampler bin/test_json \
-               bin/test_model_stream bin/k3_model \
-               bin/test_ops bin/test_cfg bin/test_cache bin/test_st bin/test_st_faults \
-               bin/test_model_stream bin/k3_model bin/test_prefix \
-               bin/bench_kernels \
-               -j"$(nproc)"
-      - name: Run under sanitizers
-        env:
-          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: |
-          ./bin/test_ops tests/fixtures/ops
-          ./bin/test_cfg fixture tests/fixtures/ref_k3.json
-          for f in no_layermap bad_layer_index bad_topk; do
-            ./bin/test_cfg reject "tests/fixtures/cfg/$f.json"
-          done
-          ./bin/test_cache tests/fixtures/cache
-          # Split expert reads: the fixture's experts only take the chunked path when
-          # the chunk is smaller than the default, and that path does the offset math.
-          K3_EXPERT_CHUNK=4096 ./bin/test_cache tests/fixtures/cache
-          ./bin/test_st tests/fixtures/st "$RUNNER_TEMP/idx.json" \
-            plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
-          ./bin/test_st_faults tests/fixtures/st "$RUNNER_TEMP/stfault"
-          ./bin/test_json
-          ./bin/test_sampler
-          ./bin/test_model_stream tests/fixtures/st
-          ./bin/k3_model tests/fixtures
-          ./bin/test_prefix
-          # The ms and GFLOP/s it prints are meaningless under -O1 with ASan interceptors
-          # on every load. It is run for what ASan sees, not for what it reports.
-          ./bin/bench_kernels
-
-      # Everything above builds the SCALAR fallbacks. Overriding CFLAGS drops $(ARCH)
-      # from the command line, so no -m flag reaches the compiler and __AVX2__ is
-      # undefined -- the `ARCH=` above is already a no-op for that reason. That leaves
-      # every _mm256_* path in k3_ops.c uninstrumented, and those are the ones that ship
-      # and the ones doing the unaligned loads and hand-computed offsets worth checking.
-      # Rebuilding just bench_kernels with the documented baseline covers both vector
-      # kernels for the cost of one more compile.
-      - name: Re-run the vector paths under sanitizers
-        env:
-          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: |
-          make clean
-          make CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer" \
-               LDFLAGS="-lm -fsanitize=address,undefined" \
-               bin/bench_kernels -j"$(nproc)"
-          ./bin/bench_kernels
-
-  # The tokenizer is portable C99 and must agree with the reference implementation
-  # token-for-token. A tokenizer that is merely "close" corrupts every prompt silently.
-  tokenizer-parity:
-    name: tokenizer parity
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-      - run: pip install --quiet tiktoken==0.13.0
-
-      # This job compiles the tokenizer and, when the vocabulary is available, checks it
-      # against the reference implementation.
-      #
-      # It CANNOT gate on a clean checkout. Both the parity check and the byte-exact
-      # roundtrip need tiktoken.model, which ships with the model weights and is not in
-      # this repository, 163,584 vocabulary entries are not something to vendor. So the
-      # job reports NOT RUN rather than passing quietly: a check that silently degrades
-      # to nothing is worse than no check at all, because the green tick still gets
-      # believed. See docs/TESTING.md, which lists this as the one gate CI cannot run.
-      - run: make bin/test_tok
-      - name: Parity vs reference tokenizer
-        env:
-          K3_TOK_FILES: ${{ github.workspace }}/tests/fixtures/tokenizer
-        run: |
-          if [ -f "$K3_TOK_FILES/tiktoken.model" ]; then
-            ./bin/test_tok "$K3_TOK_FILES" roundtrip README.md
-            python tools/tok_parity.py ./bin/test_tok
-          else
-            echo "::warning title=Tokenizer parity NOT RUN::tiktoken.model is absent" \
-                 "(it ships with the model weights, not with this repository), so" \
-                 "neither parity nor the byte-exact roundtrip was checked. Run" \
-                 "'make tok' locally against a downloaded checkpoint."
-          fi
+          name: k3-${{ runner.os }}-x64
+          path: dist/*.zip
+          if-no-files-found: error
 
   python-lint:
     name: python tools lint
@@ -331,8 +67,8 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install --quiet ruff==0.16.3
-      # Gates. Style drift in tools that generate the test fixtures is worth catching,
-      # and an unparseable tool is a broken fixture pipeline.
+      # The Python tools are optional extras (fixture generators, reference checks);
+      # nothing in the build needs them. They are still linted so they keep working.
       - run: ruff check tools/ --output-format=github
       - name: Syntax check every tool
         run: python -m compileall -q tools/

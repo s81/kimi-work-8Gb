@@ -8,10 +8,10 @@
 
 ## Verification
 
-- [ ] `make test` passes (all weightless gates)
-- [ ] `make portable` builds with no new warnings
+- [ ] `tcc -run build.c test` passes (all weightless gates, built with `-Wall -Werror`)
+- [ ] CI is green on both Linux and Windows
 - [ ] If kernels changed: `./bin/test_ops tests/fixtures/ops` still passes at declared tolerance
-- [ ] If the config or tokenizer path changed: `make cfg` and `make tok` pass
+- [ ] If the config or tokenizer path changed: `bin/test_cfg real <config.json>` and `python3 tools/tok_parity.py bin/test_tok` pass
 - [ ] If output could change: the oracle gates (`./bin/k3_model tests/fixtures`) still match exactly
 
 ## Numbers, if this is a performance change

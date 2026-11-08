@@ -140,8 +140,8 @@ ceiling, not the CPU.
 
 ## Threads
 
-`k3` runs on the **physical core count** by default. Left to itself OpenMP starts one
-thread per *logical* cpu, which on an SMT part is twice the core count, and that costs
+`k3` runs on the **physical core count** by default (its `k3_par` thread pool). Starting
+one thread per *logical* cpu, which on an SMT part is twice the core count, and that costs
 time on this workload rather than saving it: the extra threads migrate between cores and
 lose locality on a working set far larger than any cache.
 

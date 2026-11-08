@@ -551,7 +551,7 @@ static int test_truncated(const char *dir, const K3Cfg *c)
     snprintf(path, sizeof path, "%s/trunk.bin", dir);
     int wfd = open(path, O_WRONLY);
     if (wfd < 0) { perror("truncate open"); k3_trunk_close(&tr); return 1; }
-    if (ftruncate(wfd, (off_t)tr.lay[2].file_off) != 0) {
+    if (ftruncate(wfd, (int64_t)tr.lay[2].file_off) != 0) {
         perror("ftruncate"); close(wfd); k3_trunk_close(&tr); return 1;
     }
     close(wfd);

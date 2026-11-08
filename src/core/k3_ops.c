@@ -10,7 +10,7 @@
  * of the same operation agree exactly:
  *
  *   - the scalar C99 path, which is the reference,
- *   - the OpenMP path (guarded by _OPENMP), which parallelises only over independent
+ *   - the k3_par thread pool (k3_par.h), which parallelises only over independent
  *     output rows, so it introduces no reduction and changes no arithmetic,
  *   - the AVX2 path (guarded by __AVX2__), which reproduces the scalar code's
  *     four-accumulator partition and reduction tree exactly rather than choosing a
@@ -28,6 +28,7 @@
  * wide; a float32 accumulator loses precision the reference comparisons can see.
  */
 #include "k3.h"
+#include "k3_par.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -201,7 +202,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
      *
      * AUTOMATIC STORAGE at the sizes that occur. This is the innermost call in the
      * engine: once per head per token per KDA layer, which at K3 scale is 96 x 69 =
-     * 6,624 calls per token, and k3_kda_layer runs them from an OpenMP loop, so a heap
+     * 6,624 calls per token, and k3_kda_layer runs them from a k3_par parallel loop, so a heap
      * temporary here is 6,624 malloc/free pairs per token with sixteen threads
      * contending for the allocator. dv is 128 for K3, so the array below covers it and
      * the heap path is dead code in practice. */
@@ -242,6 +243,47 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     free(uheap);                                  /* free(NULL) is a no-op */
 }
 
+/* Body of the parallel loop in the function below, over o in [k3_b_, k3_e_). */
+typedef struct {
+    float * y;
+    const float * x;
+    const float * W;
+    int in;
+} k3_matmul_rows_ctx;
+static void k3_matmul_rows(void *k3_vctx_, int k3_b_, int k3_e_)
+{
+    const k3_matmul_rows_ctx *C = (const k3_matmul_rows_ctx *)k3_vctx_;
+    float * y = C->y;
+    const float * x = C->x;
+    const float * W = C->W;
+    int in = C->in;
+    (void)y;
+    (void)x;
+    (void)W;
+    (void)in;
+    for (int o = k3_b_; o < k3_e_; o++) {
+        const float *row = W + (size_t)o * in;
+        /* Sixteen accumulators, EXPLICITLY fused products. fma() in double is the
+         * same IEEE operation as _mm256_fmadd_pd per lane, so the scalar and vector
+         * paths stay bit-identical while the dependent-add latency chain that made
+         * one accumulator ~10x slower than the machine's floor disappears. The
+         * reduction pairs lanes exactly the way the vector path's (v0+v1)+(v2+v3)
+         * then cross-lane tree does; change one and you must change the other. */
+        double a[16] = {0};
+        int i = 0;
+        for (; i + 15 < in; i += 16)
+            for (int l = 0; l < 16; l++)
+                a[l] = fma((double)row[i + l], (double)x[i + l], a[l]);
+        double b0 = (a[0] + a[4]) + (a[8]  + a[12]);
+        double b1 = (a[1] + a[5]) + (a[9]  + a[13]);
+        double b2 = (a[2] + a[6]) + (a[10] + a[14]);
+        double b3 = (a[3] + a[7]) + (a[11] + a[15]);
+        double acc = (b0 + b1) + (b2 + b3);
+        for (; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
+        y[o] = (float)acc;
+    }
+}
+
 /* ---------------------------------------------------------------- matmul ---- */
 /* The dominant cost in the engine: essentially all compute time is spent here or in
  * k3_matmul_mxfp4. Two properties of this kernel are load bearing.
@@ -264,29 +306,9 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
  */
 void k3_matmul(float *y, const float *x, const float *W, int in, int out)
 {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
-#endif
-    for (int o = 0; o < out; o++) {
-        const float *row = W + (size_t)o * in;
-        /* Sixteen accumulators, EXPLICITLY fused products. fma() in double is the
-         * same IEEE operation as _mm256_fmadd_pd per lane, so the scalar and vector
-         * paths stay bit-identical while the dependent-add latency chain that made
-         * one accumulator ~10x slower than the machine's floor disappears. The
-         * reduction pairs lanes exactly the way the vector path's (v0+v1)+(v2+v3)
-         * then cross-lane tree does; change one and you must change the other. */
-        double a[16] = {0};
-        int i = 0;
-        for (; i + 15 < in; i += 16)
-            for (int l = 0; l < 16; l++)
-                a[l] = fma((double)row[i + l], (double)x[i + l], a[l]);
-        double b0 = (a[0] + a[4]) + (a[8]  + a[12]);
-        double b1 = (a[1] + a[5]) + (a[9]  + a[13]);
-        double b2 = (a[2] + a[6]) + (a[10] + a[14]);
-        double b3 = (a[3] + a[7]) + (a[11] + a[15]);
-        double acc = (b0 + b1) + (b2 + b3);
-        for (; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
-        y[o] = (float)acc;
+    {
+        k3_matmul_rows_ctx k3_ctx_ = { .y = y, .x = x, .W = W, .in = in };
+        k3_par_for(out, 64, k3_matmul_rows, &k3_ctx_);
     }
 }
 
@@ -415,6 +437,39 @@ void k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     k3_mla_cached(out, x, w, c, T, scratch, NULL, NULL, 0, 0);
 }
 
+/* Body of the parallel loop in the function below, over e in [k3_b_, k3_e_). */
+typedef struct {
+    const float * W;
+    const float * x;
+    int hidden;
+    float * score;
+    float * choice;
+    const float * bias;
+} k3_router_scores_ctx;
+static void k3_router_scores(void *k3_vctx_, int k3_b_, int k3_e_)
+{
+    const k3_router_scores_ctx *C = (const k3_router_scores_ctx *)k3_vctx_;
+    const float * W = C->W;
+    const float * x = C->x;
+    int hidden = C->hidden;
+    float * score = C->score;
+    float * choice = C->choice;
+    const float * bias = C->bias;
+    (void)W;
+    (void)x;
+    (void)hidden;
+    (void)score;
+    (void)choice;
+    (void)bias;
+    for (int e = k3_b_; e < k3_e_; e++) {
+        const float *row = W + (size_t)e * hidden;
+        double acc = 0.0;
+        for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
+        score[e]  = 1.0f / (1.0f + expf(-(float)acc));
+        choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+    }
+}
+
 /* ---------------------------------------------------------------- router ---- */
 void k3_router(int *idx, float *w, const float *x, const float *W,
                const float *bias, int hidden, int n_experts, int topk,
@@ -441,15 +496,9 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
      * ORDER INSIDE an expert is untouched: thread t still sums i = 0..hidden-1 in
      * sequence into its own double. Splitting the outer loop therefore cannot change a
      * single bit, which is why this needs no tolerance and no re-gating. */
-#ifdef _OPENMP
-#   pragma omp parallel for schedule(static)
-#endif
-    for (int e = 0; e < n_experts; e++) {
-        const float *row = W + (size_t)e * hidden;
-        double acc = 0.0;
-        for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
-        score[e]  = 1.0f / (1.0f + expf(-(float)acc));
-        choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+    {
+        k3_router_scores_ctx k3_ctx_ = { .W = W, .x = x, .hidden = hidden, .score = score, .choice = choice, .bias = bias };
+        k3_par_for(n_experts, 0, k3_router_scores, &k3_ctx_);
     }
 
     /* top-k by repeated max. n_experts is 896 and topk is 16, so this is 14k
@@ -847,6 +896,62 @@ size_t k3_kda_scratch(const K3Cfg *c, int T)
          + (size_t)c->kda_head_dim; /* f_a output                    */
 }
 
+/* Body of the parallel loop in the function below, over h in [k3_b_, k3_e_). */
+typedef struct {
+    float * wr;
+    int T;
+    int P;
+    int D;
+    int H;
+    const float * q;
+    float qscale;
+    float * S;
+    float * o;
+    const float * k;
+    const float * v;
+    const float * al;
+    const float * bt;
+} k3_kda_heads_ctx;
+static void k3_kda_heads(void *k3_vctx_, int k3_b_, int k3_e_)
+{
+    const k3_kda_heads_ctx *C = (const k3_kda_heads_ctx *)k3_vctx_;
+    float * wr = C->wr;
+    int T = C->T;
+    int P = C->P;
+    int D = C->D;
+    int H = C->H;
+    const float * q = C->q;
+    float qscale = C->qscale;
+    float * S = C->S;
+    float * o = C->o;
+    const float * k = C->k;
+    const float * v = C->v;
+    const float * al = C->al;
+    const float * bt = C->bt;
+    (void)wr;
+    (void)T;
+    (void)P;
+    (void)D;
+    (void)H;
+    (void)q;
+    (void)qscale;
+    (void)S;
+    (void)o;
+    (void)k;
+    (void)v;
+    (void)al;
+    (void)bt;
+    for (int h = k3_b_; h < k3_e_; h++) {
+        float *wh = wr + (size_t)h * D;
+        for (int t = 0; t < T; t++) {
+            const size_t off = (size_t)t * P + (size_t)h * D;
+            for (int i = 0; i < D; i++) wh[i] = q[off + i] * qscale;
+            k3_kda_step(S + (size_t)h * D * D, o + off, wh, k + off, v + off,
+                        al + off, bt[(size_t)t * H + h], D, D);
+        }
+    }
+}
+
 void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
                   int T, float *state, float *scratch)
 {
@@ -910,17 +1015,9 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
      * is 0.4% of FLOPs but, serial, it is a majority of non-matmul wall time at high
      * core counts. wr is a full P-wide work row, so wr + h*D gives each head a private
      * slice with no new allocation. */
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int h = 0; h < H; h++) {
-        float *wh = wr + (size_t)h * D;
-        for (int t = 0; t < T; t++) {
-            const size_t off = (size_t)t * P + (size_t)h * D;
-            for (int i = 0; i < D; i++) wh[i] = q[off + i] * qscale;
-            k3_kda_step(S + (size_t)h * D * D, o + off, wh, k + off, v + off,
-                        al + off, bt[(size_t)t * H + h], D, D);
-        }
+    {
+        k3_kda_heads_ctx k3_ctx_ = { .wr = wr, .T = T, .P = P, .D = D, .H = H, .q = q, .qscale = qscale, .S = S, .o = o, .k = k, .v = v, .al = al, .bt = bt };
+        k3_par_for(H, 0, k3_kda_heads, &k3_ctx_);
     }
 
     /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection */
@@ -1075,42 +1172,25 @@ static const float K3_E2M1[16] = {
 #include <arm_neon.h>
 #endif
 
-/* y[out] = W[out][in] . x[in], with W stored as bf16 and widened on read.
- *
- * WHY THIS EXISTS
- *   The checkpoint ships the dense trunk as bf16. Holding it as fp32 would double the
- *   resident set and double the weight traffic per token. These kernels are bandwidth
- *   bound, so halving the bytes read makes them faster, not slower, the same reason
- *   the MXFP4 path beats dequantise-then-multiply.
- *
- * WHY IT LOSES NOTHING
- *   bf16 is what the checkpoint already contains. Widening bf16 to fp32 is a pure left
- *   shift by 16 bits with no rounding, so multiplying from bf16 storage computes with
- *   exactly the values an fp32 copy would have supplied. The only difference from
- *   k3_matmul is WHERE the widening happens, not what is widened.
- *
- * The accumulator layout mirrors k3_matmul deliberately, four partial sums in double,
- * reduced in the same order, so the two kernels agree to the bit on identical input.
- *
- * THE AVX2 PATH IS BIT-IDENTICAL TO THE SCALAR PATH, not merely close. A __m256d holds
- * exactly four doubles, and loading four consecutive elements per iteration places
- * element i in lane i%4: the same partition as the scalar accumulators, with the same
- * sequential order within each lane. Reducing with (a0+a1)+(a2+a3) then reproduces the
- * scalar result exactly. Two details carry that guarantee:
- *
- *   - MUL THEN ADD, never _mm256_fmadd_pd. The build sets -ffp-contract=off, so the
- *     scalar code rounds the product and the sum separately while an FMA rounds once.
- *     Here the product happens to be exact (a bf16 widens exactly, and float x float
- *     needs 48 mantissa bits, which fits double's 53), so the two would agree anyway
- *     but that is a proof about the inputs. Mul-then-add is a proof about the code.
- *   - The scalar tail loop is reused verbatim for the in % 4 remainder.
- */
-void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
+/* Body of the parallel loop in the function below, over o in [k3_b_, k3_e_). */
+typedef struct {
+    float * y;
+    const float * x;
+    const uint16_t * W;
+    int in;
+} k3_bf16_rows_ctx;
+static void k3_bf16_rows(void *k3_vctx_, int k3_b_, int k3_e_)
 {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
-#endif
-    for (int o = 0; o < out; o++) {
+    const k3_bf16_rows_ctx *C = (const k3_bf16_rows_ctx *)k3_vctx_;
+    float * y = C->y;
+    const float * x = C->x;
+    const uint16_t * W = C->W;
+    int in = C->in;
+    (void)y;
+    (void)x;
+    (void)W;
+    (void)in;
+    for (int o = k3_b_; o < k3_e_; o++) {
         const uint16_t *row = W + (size_t)o * in;
         int i = 0;
         double acc;
@@ -1212,20 +1292,66 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
     }
 }
 
-/* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8
- * weights are widened to float, dotted with the fp32 activation, and the row's scale is
- * applied once at the end. Unlike the trunk kernels this carries NO cross-path
- * determinism contract (K3_WI8 is draft-only, and the exact model decides every emitted
- * token), so it accumulates in float with fused products and the natural AVX2 reduction,
- * which is what makes it fast. */
-void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
+/* y[out] = W[out][in] . x[in], with W stored as bf16 and widened on read.
+ *
+ * WHY THIS EXISTS
+ *   The checkpoint ships the dense trunk as bf16. Holding it as fp32 would double the
+ *   resident set and double the weight traffic per token. These kernels are bandwidth
+ *   bound, so halving the bytes read makes them faster, not slower, the same reason
+ *   the MXFP4 path beats dequantise-then-multiply.
+ *
+ * WHY IT LOSES NOTHING
+ *   bf16 is what the checkpoint already contains. Widening bf16 to fp32 is a pure left
+ *   shift by 16 bits with no rounding, so multiplying from bf16 storage computes with
+ *   exactly the values an fp32 copy would have supplied. The only difference from
+ *   k3_matmul is WHERE the widening happens, not what is widened.
+ *
+ * The accumulator layout mirrors k3_matmul deliberately, four partial sums in double,
+ * reduced in the same order, so the two kernels agree to the bit on identical input.
+ *
+ * THE AVX2 PATH IS BIT-IDENTICAL TO THE SCALAR PATH, not merely close. A __m256d holds
+ * exactly four doubles, and loading four consecutive elements per iteration places
+ * element i in lane i%4: the same partition as the scalar accumulators, with the same
+ * sequential order within each lane. Reducing with (a0+a1)+(a2+a3) then reproduces the
+ * scalar result exactly. Two details carry that guarantee:
+ *
+ *   - MUL THEN ADD, never _mm256_fmadd_pd. The build sets -ffp-contract=off, so the
+ *     scalar code rounds the product and the sum separately while an FMA rounds once.
+ *     Here the product happens to be exact (a bf16 widens exactly, and float x float
+ *     needs 48 mantissa bits, which fits double's 53), so the two would agree anyway
+ *     but that is a proof about the inputs. Mul-then-add is a proof about the code.
+ *   - The scalar tail loop is reused verbatim for the in % 4 remainder.
+ */
+void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
-    const unsigned char *base = (const unsigned char *)W;
-    const size_t rowb = (size_t)4 + (size_t)in;
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
-#endif
-    for (int o = 0; o < out; o++) {
+    {
+        k3_bf16_rows_ctx k3_ctx_ = { .y = y, .x = x, .W = W, .in = in };
+        k3_par_for(out, 64, k3_bf16_rows, &k3_ctx_);
+    }
+}
+
+/* Body of the parallel loop in the function below, over o in [k3_b_, k3_e_). */
+typedef struct {
+    float * y;
+    const float * x;
+    const unsigned char * base;
+    size_t rowb;
+    int in;
+} k3_q8_rows_ctx;
+static void k3_q8_rows(void *k3_vctx_, int k3_b_, int k3_e_)
+{
+    const k3_q8_rows_ctx *C = (const k3_q8_rows_ctx *)k3_vctx_;
+    float * y = C->y;
+    const float * x = C->x;
+    const unsigned char * base = C->base;
+    size_t rowb = C->rowb;
+    int in = C->in;
+    (void)y;
+    (void)x;
+    (void)base;
+    (void)rowb;
+    (void)in;
+    for (int o = k3_b_; o < k3_e_; o++) {
         const unsigned char *row = base + (size_t)o * rowb;
         float scale;
         memcpy(&scale, row, 4);
@@ -1288,6 +1414,22 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
     }
 }
 
+/* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8
+ * weights are widened to float, dotted with the fp32 activation, and the row's scale is
+ * applied once at the end. Unlike the trunk kernels this carries NO cross-path
+ * determinism contract (K3_WI8 is draft-only, and the exact model decides every emitted
+ * token), so it accumulates in float with fused products and the natural AVX2 reduction,
+ * which is what makes it fast. */
+void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
+{
+    const unsigned char *base = (const unsigned char *)W;
+    const size_t rowb = (size_t)4 + (size_t)in;
+    {
+        k3_q8_rows_ctx k3_ctx_ = { .y = y, .x = x, .base = base, .rowb = rowb, .in = in };
+        k3_par_for(out, 64, k3_q8_rows, &k3_ctx_);
+    }
+}
+
 /* A whole BYTE to its two E2M1 values, so the inner loop does one 8-byte load instead
  * of masking, shifting and two separate lookups. 2 KB, built once, shared by all
  * threads after initialisation.
@@ -1338,96 +1480,43 @@ static void k3_e8m0_init(void)
     k3_e8m0_ready = 1;
 }
 
-/* y[rows] = W[rows][in] . x[in], with W read straight out of packed MXFP4 and never
- * materialised as floats. This is not an optimisation; it is what makes streaming
- * experts possible at all.
- *
- * One routed expert is 33,030,144 parameters. Dequantised to fp32 that is 132 MB, so
- * the 1,472 experts a single token touches would be 194 GB of materialised weights. As
- * packed nibbles the same expert is 17.55 MB. A matrix-vector product is memory bound,
- * so reading 7.5x fewer bytes makes this kernel FASTER than dequantising first.
- *
- * The loop is structured around the 32-element group because the scale is constant
- * within one: it factors out of the inner sum and is applied once per group instead of
- * once per element. At group 32 each group is exactly 16 packed bytes.
- *
- * PRECONDITIONS:
- *   - group <= 64. The expanded group goes into a fixed wf[64] stack buffer.
- *     Checked below; violating it aborts with a FATAL message rather than
- *     overflowing the buffer.
- *   - `in` is even. The packed row stride is in/2 bytes, two elements per byte.
- *     Checked below for the same reason.
- *   - `packed` is rows x (in/2) bytes; `scales` is rows x ceil(in/group) bytes.
- *     Not checked; the caller owns these buffer sizes.
- *   - A scale byte of 255 is NaN by the OCP MX spec and zeroes its whole group.
- *
- * ACCURACY CONTRACT. This kernel is deliberately NOT bit-identical to
- * dequantise-then-k3_matmul, and no caller should assume it is. On AVX2 with a
- * group that is a multiple of 16 (K3 uses 32) it runs the FLAT ROW PATH below: the
- * E8M0 power-of-two scale is folded into each E2M1 weight exactly, and the whole
- * row is summed by sixteen independent double accumulator lanes (four __m256d).
- * Otherwise it sums each
- * group of 32 and applies that group's scale before accumulating. Both orderings
- * differ from dequantise-then-matmul's single accumulator set.
- *
- * The difference is bounded and tiny. Every individual product is EXACT in double, an
- * E2M1 value carries 3 mantissa bits and x carries 24, so the product needs 27 of the
- * 53 available, so only the additions round, and reassociating exact terms moves the
- * result by roughly 1 ULP of double, order 1e-16 relative. The required agreement is
- * 1e-6 against dequantise-then-matmul on real checkpoint weights, gated by
- * tests/unit/test_expert.c. The margin is nine orders of magnitude.
- */
-void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
-                     const unsigned char *scales, int in, int rows, int group)
+/* Body of the parallel loop in the function below, over r in [k3_b_, k3_e_). */
+typedef struct {
+    float * y;
+    const float * x;
+    const unsigned char * packed;
+    const unsigned char * scales;
+    int in;
+    int group;
+    int pcols;
+    int ngrp;
+    int gbyte;
+    double * xd;
+} k3_mxfp4_rows_ctx;
+static void k3_mxfp4_rows(void *k3_vctx_, int k3_b_, int k3_e_)
 {
-    if (in & 1) {
-        fprintf(stderr,
-                "k3: FATAL, k3_matmul_mxfp4 called with in=%d, which is odd.\n"
-                "    Packed rows are in/2 bytes, two elements per byte; an odd `in`\n"
-                "    truncates that stride below what the trailing group's odd\n"
-                "    remainder reads, a heap read past the caller's buffer instead\n"
-                "    of failing loudly.\n",
-                in);
-        abort();
-    }
-    if (group > 64) {
-        fprintf(stderr,
-                "k3: FATAL, k3_matmul_mxfp4 called with group=%d, which exceeds 64.\n"
-                "    Each group is expanded into a fixed wf[64] stack buffer before\n"
-                "    the dot product; a larger group overflows it instead of failing\n"
-                "    loudly.\n",
-                group);
-        abort();
-    }
-
-    const int pcols = in / 2;                     /* two elements per byte */
-    const int ngrp  = (in + group - 1) / group;
-    const int gbyte = group / 2;
-
-#if !defined(__AVX2__)
-    if (!k3_pair_ready)  k3_pair_init();
-#endif
-    if (!k3_e8m0_ready)  k3_e8m0_init();
-
-    /* WIDEN x ONCE, NOT ONCE PER ROW. The accumulators are double, so every row used to
-     * re-run the same `in` float-to-double conversions -- 3072 rows x 3584 elements is
-     * 11 M conversions per call to produce 3584 distinct values. x does not depend on r,
-     * so it is hoisted here and the row loop reads doubles directly.
-     *
-     * BIT-IDENTICAL: float to double is exact (24 mantissa bits into 53), so the widened
-     * copy holds precisely what _mm256_cvtps_pd produced in place.
-     *
-     * Read-only and shared by every thread, so one copy serves the whole parallel
-     * region. At the K3 shapes it is 28 KB, which stays in L2 while the packed weights
-     * stream past it. NULL is a valid state: the group loop then widens into a small
-     * stack buffer instead, so an allocation failure costs speed and nothing else. */
-    double *const xd = (double *)malloc((size_t)in * sizeof(double));
-    if (xd) for (int i = 0; i < in; i++) xd[i] = (double)x[i];
-
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (rows > 64)
-#endif
-    for (int r = 0; r < rows; r++) {
+    const k3_mxfp4_rows_ctx *C = (const k3_mxfp4_rows_ctx *)k3_vctx_;
+    float * y = C->y;
+    const float * x = C->x;
+    const unsigned char * packed = C->packed;
+    const unsigned char * scales = C->scales;
+    int in = C->in;
+    int group = C->group;
+    int pcols = C->pcols;
+    int ngrp = C->ngrp;
+    int gbyte = C->gbyte;
+    double * xd = C->xd;
+    (void)y;
+    (void)x;
+    (void)packed;
+    (void)scales;
+    (void)in;
+    (void)group;
+    (void)pcols;
+    (void)ngrp;
+    (void)gbyte;
+    (void)xd;
+    for (int r = k3_b_; r < k3_e_; r++) {
         const unsigned char *pr = packed + (size_t)r * pcols;
         const unsigned char *sr = scales + (size_t)r * ngrp;
         double acc = 0.0;
@@ -1779,6 +1868,98 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
             acc += sub * (double)K3_E8M0[sb];
         }
         y[r] = (float)acc;
+    }
+}
+
+/* y[rows] = W[rows][in] . x[in], with W read straight out of packed MXFP4 and never
+ * materialised as floats. This is not an optimisation; it is what makes streaming
+ * experts possible at all.
+ *
+ * One routed expert is 33,030,144 parameters. Dequantised to fp32 that is 132 MB, so
+ * the 1,472 experts a single token touches would be 194 GB of materialised weights. As
+ * packed nibbles the same expert is 17.55 MB. A matrix-vector product is memory bound,
+ * so reading 7.5x fewer bytes makes this kernel FASTER than dequantising first.
+ *
+ * The loop is structured around the 32-element group because the scale is constant
+ * within one: it factors out of the inner sum and is applied once per group instead of
+ * once per element. At group 32 each group is exactly 16 packed bytes.
+ *
+ * PRECONDITIONS:
+ *   - group <= 64. The expanded group goes into a fixed wf[64] stack buffer.
+ *     Checked below; violating it aborts with a FATAL message rather than
+ *     overflowing the buffer.
+ *   - `in` is even. The packed row stride is in/2 bytes, two elements per byte.
+ *     Checked below for the same reason.
+ *   - `packed` is rows x (in/2) bytes; `scales` is rows x ceil(in/group) bytes.
+ *     Not checked; the caller owns these buffer sizes.
+ *   - A scale byte of 255 is NaN by the OCP MX spec and zeroes its whole group.
+ *
+ * ACCURACY CONTRACT. This kernel is deliberately NOT bit-identical to
+ * dequantise-then-k3_matmul, and no caller should assume it is. On AVX2 with a
+ * group that is a multiple of 16 (K3 uses 32) it runs the FLAT ROW PATH below: the
+ * E8M0 power-of-two scale is folded into each E2M1 weight exactly, and the whole
+ * row is summed by sixteen independent double accumulator lanes (four __m256d).
+ * Otherwise it sums each
+ * group of 32 and applies that group's scale before accumulating. Both orderings
+ * differ from dequantise-then-matmul's single accumulator set.
+ *
+ * The difference is bounded and tiny. Every individual product is EXACT in double, an
+ * E2M1 value carries 3 mantissa bits and x carries 24, so the product needs 27 of the
+ * 53 available, so only the additions round, and reassociating exact terms moves the
+ * result by roughly 1 ULP of double, order 1e-16 relative. The required agreement is
+ * 1e-6 against dequantise-then-matmul on real checkpoint weights, gated by
+ * tests/unit/test_expert.c. The margin is nine orders of magnitude.
+ */
+void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
+                     const unsigned char *scales, int in, int rows, int group)
+{
+    if (in & 1) {
+        fprintf(stderr,
+                "k3: FATAL, k3_matmul_mxfp4 called with in=%d, which is odd.\n"
+                "    Packed rows are in/2 bytes, two elements per byte; an odd `in`\n"
+                "    truncates that stride below what the trailing group's odd\n"
+                "    remainder reads, a heap read past the caller's buffer instead\n"
+                "    of failing loudly.\n",
+                in);
+        abort();
+    }
+    if (group > 64) {
+        fprintf(stderr,
+                "k3: FATAL, k3_matmul_mxfp4 called with group=%d, which exceeds 64.\n"
+                "    Each group is expanded into a fixed wf[64] stack buffer before\n"
+                "    the dot product; a larger group overflows it instead of failing\n"
+                "    loudly.\n",
+                group);
+        abort();
+    }
+
+    const int pcols = in / 2;                     /* two elements per byte */
+    const int ngrp  = (in + group - 1) / group;
+    const int gbyte = group / 2;
+
+#if !defined(__AVX2__)
+    if (!k3_pair_ready)  k3_pair_init();
+#endif
+    if (!k3_e8m0_ready)  k3_e8m0_init();
+
+    /* WIDEN x ONCE, NOT ONCE PER ROW. The accumulators are double, so every row used to
+     * re-run the same `in` float-to-double conversions -- 3072 rows x 3584 elements is
+     * 11 M conversions per call to produce 3584 distinct values. x does not depend on r,
+     * so it is hoisted here and the row loop reads doubles directly.
+     *
+     * BIT-IDENTICAL: float to double is exact (24 mantissa bits into 53), so the widened
+     * copy holds precisely what _mm256_cvtps_pd produced in place.
+     *
+     * Read-only and shared by every thread, so one copy serves the whole parallel
+     * region. At the K3 shapes it is 28 KB, which stays in L2 while the packed weights
+     * stream past it. NULL is a valid state: the group loop then widens into a small
+     * stack buffer instead, so an allocation failure costs speed and nothing else. */
+    double *const xd = (double *)malloc((size_t)in * sizeof(double));
+    if (xd) for (int i = 0; i < in; i++) xd[i] = (double)x[i];
+
+    {
+        k3_mxfp4_rows_ctx k3_ctx_ = { .y = y, .x = x, .packed = packed, .scales = scales, .in = in, .group = group, .pcols = pcols, .ngrp = ngrp, .gbyte = gbyte, .xd = xd };
+        k3_par_for(rows, 64, k3_mxfp4_rows, &k3_ctx_);
     }
 
     free(xd);                                     /* free(NULL) is a no-op */

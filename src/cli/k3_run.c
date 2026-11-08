@@ -54,13 +54,9 @@
 #include <time.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <psapi.h>
+#include <windows.h>   /* peak RSS: k3_win_peak_rss_bytes in src/compat/k3_win32.h */
 #else
 #include <sys/resource.h>
-#endif
-#ifdef _OPENMP
-#include <omp.h>
 #endif
 
 #include "k3_portable_io.h"   /* getline() shim for MinGW; see the header for why */
@@ -68,6 +64,7 @@
 #include "k3_bind.h"
 #include "k3_cache.h"
 #include "k3_trunk.h"
+#include "k3_par.h"
 #include "k3_tok.h"   /* text in/out; the --ids path never touches it */
 #include "k3_chat.h"
 #include "k3_prefix.h"
@@ -218,40 +215,6 @@ static int spec_draft(const int *seq, int T, int cap, int *out)
  * for" -- because entering it needs ~122 GB available, and by then 3% is over 3.7 GB. */
 #define K3_MEM_ADMIT 0.95
 
-#ifdef _OPENMP
-/* Physical cores, or 0 when the topology cannot be read.
- *
- * OpenMP's default is one thread per LOGICAL cpu, which on an SMT part is twice the core
- * count. This workload loses badly at that setting: on a 16-core/32-thread machine the
- * unbound 32-thread default measured 7.41 s/token against 5.63 at 16, because 32 threads
- * migrating across two CCDs destroy locality on a 100+ GB working set. Counting cores
- * needs the sibling topology; nothing in the C standard exposes it.
- *
- * A cpu is counted when it is the lowest-numbered member of its own sibling list, which
- * yields exactly one cpu per physical core. */
-static int k3_physical_cores(void)
-{
-#if defined(__linux__)
-    int cores = 0;
-    for (int cpu = 0; cpu < 4096; cpu++) {
-        char path[128];
-        snprintf(path, sizeof path,
-                 "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
-        FILE *f = fopen(path, "r");
-        if (!f) {
-            if (cpu == 0) return 0;   /* no topology at all: caller keeps the default */
-            break;                    /* ran off the end of the online cpus */
-        }
-        int first = -1;
-        if (fscanf(f, "%d", &first) == 1 && first == cpu) cores++;
-        fclose(f);
-    }
-    return cores;
-#else
-    return 0;
-#endif
-}
-#endif /* _OPENMP */
 
 static void usage(FILE *f)
 {
@@ -278,10 +241,10 @@ static void usage(FILE *f)
 "                        the reader run a layer further ahead and costs one more slot\n"
 "                        of RAM; the budget still wins if it does not fit\n"
 "  --cache-gb X          routed-expert cache budget\n"
-"  --threads N           OpenMP threads. Default is the physical core count, not the\n"
-"                        logical cpu count OpenMP would otherwise pick: on an SMT part\n"
-"                        the extra threads migrate across cores and cost more than they\n"
-"                        add. OMP_NUM_THREADS, if set, still wins\n"
+"  --threads N           worker threads. Default is the physical core count, not the\n"
+"                        logical cpu count: on an SMT part the extra threads migrate\n"
+"                        across cores and cost more than they add. OMP_NUM_THREADS,\n"
+"                        if set, still wins\n"
 "  --ultra-low-memory    stream embedding rows and lm_head chunks, and reuse one\n"
 "                        recurrent-state slot during full recompute; needs --trunk\n"
 "\n"
@@ -414,9 +377,7 @@ static double peak_rss_bytes(void)
 #ifdef _WIN32
     /* PeakWorkingSetSize is Windows' peak-RSS equivalent, already in bytes -- no
      * kilobyte scaling needed, unlike ru_maxrss on Linux. */
-    PROCESS_MEMORY_COUNTERS pmc;
-    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) return 0.0;
-    return (double)pmc.PeakWorkingSetSize;
+    return k3_win_peak_rss_bytes();
 #else
     struct rusage ru;
     if (getrusage(RUSAGE_SELF, &ru) != 0) return 0.0;
@@ -998,22 +959,14 @@ int main(int argc, char **argv)
         else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
 
-#ifdef _OPENMP
     /* Thread selection, in precedence order: --threads, then OMP_NUM_THREADS, then the
-     * physical core count. Only the last is a change from OpenMP's own default, which is
-     * one thread per logical cpu. An explicit OMP_NUM_THREADS is left alone so existing
-     * scripts and the docs that mention it keep working. */
-    if (threads > 0) {
-        omp_set_num_threads(threads);
-    } else if (!getenv("OMP_NUM_THREADS")) {
-        const int cores = k3_physical_cores();
-        if (cores > 0 && cores < omp_get_max_threads()) omp_set_num_threads(cores);
-    }
-    printf("threads: %d\n", omp_get_max_threads());
-#else
-    if (threads > 0)
-        fprintf(stderr, "--threads ignored: built without OpenMP\n");
-#endif
+     * physical core count (k3_par_default_threads). Physical rather than logical: on an
+     * SMT part the unbound 32-thread setting measured 7.41 s/token against 5.63 at 16 on
+     * a 16-core/32-thread machine, because threads migrating across two CCDs destroy
+     * locality on a 100+ GB working set. OMP_NUM_THREADS keeps its old meaning so
+     * existing scripts and the docs that mention it keep working. */
+    if (threads > 0) k3_par_set_threads(threads);
+    printf("threads: %d\n", k3_par_threads());
 
     if (ultra && !trunk_dir) {
         fprintf(stderr, "--ultra-low-memory needs --trunk; resident trunk cannot fit its "

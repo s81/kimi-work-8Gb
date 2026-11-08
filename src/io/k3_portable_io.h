@@ -186,22 +186,14 @@ static inline int k3_win_open(const char *path, int flags, ...)
 }
 #define open(path, flags, ...) k3_win_open((path), (flags))
 
-/* GCC/Clang recognise the name posix_memalign as a built-in for optimisation purposes
- * (constant folding, alias analysis) even though MinGW's headers declare no such
- * function and its runtime provides no such symbol -- confirmed directly: a call to
- * it with no other declaration in scope fails with "implicit declaration", not a
- * link error, meaning nothing backs the built-in's assumed semantics. This
- * definition is therefore not optional the way the -Wshadow warning below implies;
- * it is the only real implementation on this platform. The pragma silences the
- * warning without silencing -Wshadow project-wide. */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wshadow"
+/* posix_memalign for Windows, whose C runtime has no such function: _aligned_malloc
+ * provides the same aligned block. Freeing it needs _aligned_free, not free(); see
+ * k3_aligned_free below. */
 static inline int posix_memalign(void **out, size_t align, size_t len)
 {
     *out = _aligned_malloc(len, align);
     return *out ? 0 : ENOMEM;
 }
-#pragma GCC diagnostic pop
 
 /* On real POSIX, a posix_memalign'd pointer is safe to pass to plain free() -- that is
  * the entire point of the interface. _aligned_malloc has no such guarantee: pairing it
@@ -289,6 +281,12 @@ static inline int k3_win_mkdir(const char *path, int mode)
  * tolerates losing. */
 #define madvise(addr, len, advice) ((void)0)
 #define MADV_HUGEPAGE 0
+
+/* 64-bit file offsets. The Windows C runtime's lseek and off_t are 32-bit, so a size or
+ * offset past 2 GB -- every real checkpoint shard -- would silently wrap. _lseeki64 is
+ * the same call with a 64-bit offset. Call sites hold offsets in int64_t, never off_t,
+ * for the same reason (caught by test_model_stream's 2^60-offset short-read check). */
+#define lseek(fd, off, whence) _lseeki64((fd), (long long)(off), (whence))
 
 /* O_DIRECT already forced open()-time behavior above; nothing left to do post-open. */
 static inline int k3_set_direct(int fd) { (void)fd; return 0; }

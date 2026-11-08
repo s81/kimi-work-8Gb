@@ -32,6 +32,6 @@ body:
   - type: textarea
     id: gates
     attributes:
-      label: Output of `make test`
+      label: Output of `tcc -run build.c test`
       render: shell
     validations: {required: true}
