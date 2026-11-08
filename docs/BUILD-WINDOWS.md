@@ -96,5 +96,7 @@ See the README's *Building* section for the measurements.
   and natively in CI on `windows-latest`): `22 passed, 0 failed, 0 skipped`, `VERDICT:
   ENGINE MATCHES THE REFERENCE EXACTLY`, `ALL WEIGHTLESS TESTS PASSED`. Two subtests skip
   themselves by design on Windows (no inodes, no `fork`).
-- Not verified: inference on real Kimi K3 weights on Windows, and tokenizer parity; both
-  need the checkpoint.
+- On real Kimi K3 weights the same TCC code passed `test-all`, the torch binding
+  check (`verify_real_layer.py`), the expert byte check and tokenizer parity (45/45), but
+  on **Linux** only; see *Without the whole checkpoint* in [TESTING.md](TESTING.md).
+- Not verified: any real-weight run on Windows, and inference with all 93 layers.

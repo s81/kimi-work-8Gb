@@ -23,7 +23,7 @@ THE CHAIN, AND THE LINK THIS CHECKS
     Zero tolerance throughout. Both sides are reading identical bytes off identical
     weights; there is nothing here that could legitimately differ.
 
-usage: verify_expert.py [expert_dump.json] [fixtures/mxfp4.json]
+usage: verify_expert.py [expert_dump.json] [tests/fixtures/mxfp4.json]
 """
 from __future__ import annotations
 
@@ -34,9 +34,10 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _paths import FIX_OPS
+from _paths import FIXTURES
 
-DEF_FX = os.path.join(FIX_OPS, "mxfp4.json")
+# tests/fixtures/mxfp4.json, beside the per-op fixtures rather than inside ops/.
+DEF_FX = os.path.join(FIXTURES, "mxfp4.json")
 
 
 def main():

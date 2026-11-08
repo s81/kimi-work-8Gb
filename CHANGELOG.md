@@ -5,6 +5,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Verified
+
+- **Real Kimi K3 weights with the TCC build, Linux.** Using four of the 96 released
+  shards (about 24 GB: layers 0 and 1, embedding and head): `test-all` passes on layer 1,
+  including fused MXFP4 against dequantise-then-matmul with zero difference on real
+  expert weights; `tools/verify_real_layer.py` confirms every attention, router and MoE
+  binding against torch at float32 rounding; `tools/verify_expert.py` confirms the bytes
+  and dequantisation exactly; tokenizer parity is 45/45 and the chat-template checks pass
+  with the released `tiktoken.model`; the released `config.json` passes `test_cfg real`;
+  and `k3 --layers 2` runs prompt to token. Not covered: Windows, and the full
+  93-layer model. Details and commands in `docs/TESTING.md`.
+
+### Fixed
+
+- **`tools/verify_expert.py` default fixture path.** It looked for
+  `tests/fixtures/ops/mxfp4.json`; the file is `tests/fixtures/mxfp4.json`, so running it
+  without arguments crashed.
+
 ### Added
 
 - **Release preflight.** `release.yml` now refuses a tag that does not match
