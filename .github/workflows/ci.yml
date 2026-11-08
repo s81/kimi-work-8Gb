@@ -47,6 +47,15 @@ jobs:
           grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY"  "$RUNNER_TEMP/test.log"
           grep -q "ALL WEIGHTLESS TESTS PASSED"                    "$RUNNER_TEMP/test.log"
 
+      # Kernel timings at real Kimi K3 dimensions on this runner, so Linux and Windows
+      # are measured on comparable machines every push. Informational: shared runners
+      # vary by tens of percent, so this never fails the build. Output digests that
+      # differ between the two OSes point at a libm difference (expf, tanhf), not a bug.
+      - name: Kernel benchmark (informational)
+        shell: bash
+        continue-on-error: true
+        run: tcc -run build.c bench
+
       # The release zip for this platform, so every run has a downloadable build.
       - name: tcc -run build.c dist
         shell: bash
