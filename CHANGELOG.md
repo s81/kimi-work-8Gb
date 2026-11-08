@@ -5,6 +5,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-08
+
+Linux and Windows x86-64 release, built with the Tiny C Compiler only. Release notes:
+[`.github/release-notes/v1.2.0.md`](.github/release-notes/v1.2.0.md).
+
 ### Changed (this fork): built with the Tiny C Compiler only
 
 - **The build is now `tcc -run build.c`**, one C file run by the Tiny C Compiler on
@@ -28,6 +33,9 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   upload both zips on every run, and publish Linux and Windows zips with
   `SHA256SUMS.txt` on `v*` tags. The macOS, sanitizer and CMake jobs are gone, since
   none of them can run with TCC.
+- **CI actions updated** to `upload-artifact` v7, `download-artifact` v8 and
+  `action-gh-release` v3 (Node 24 runtime).
+- **Version** is now `1.2.0` (`k3 --version`, zip names).
 
 ### Performance
 
@@ -342,7 +350,8 @@ First public release.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md).
 
-[Unreleased]: https://github.com/FareedKhan-dev/kimi-k3-in-c/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/s81/kimi-work-8Gb/releases/tag/v1.2.0
 [1.1.0-win.1]: https://github.com/s81/kimi-work-8Gb/releases/tag/v1.1.0-win.1
 [1.1.0]: https://github.com/FareedKhan-dev/kimi-k3-in-c/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/FareedKhan-dev/kimi-k3-in-c/compare/v0.1.0...v1.0.0
