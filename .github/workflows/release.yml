@@ -39,7 +39,7 @@ jobs:
         shell: bash
         run: tcc -run build.c dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: k3-${{ runner.os }}-x64
           path: dist/*.zip
@@ -58,7 +58,7 @@ jobs:
         with:
           sparse-checkout: .github/release-notes
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: k3-*-x64
           path: dist
@@ -87,7 +87,7 @@ jobs:
             echo "generate=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.ref_name }}
           body_path: ${{ steps.notes.outputs.path }}
