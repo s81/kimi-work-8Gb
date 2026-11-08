@@ -14,6 +14,8 @@
 <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.1.0-brightgreen?style=flat-square" alt="Version"></a>
 </p>
 
+<p><b>Windows x64:</b> download the prebuilt <code>k3.exe</code> from the <a href="https://github.com/s81/kimi-work-8Gb/releases/tag/v1.1.0-win.1">v1.1.0-win.1 release</a> (<a href="https://github.com/s81/kimi-work-8Gb/releases/latest">latest release</a>). It's statically linked, so no installer is needed. To build it yourself, see <a href="docs/BUILD-WINDOWS.md">docs/BUILD-WINDOWS.md</a>.</p>
+
 <table>
 <tr>
 <td align="center"><b>2.78T</b><br><sub>parameters</sub></td>
