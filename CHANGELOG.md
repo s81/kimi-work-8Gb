@@ -5,6 +5,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-08
+
+Linux and Windows x86-64 release with the faster TCC kernels. Release notes:
+[`.github/release-notes/v1.2.1.md`](.github/release-notes/v1.2.1.md).
+
 ### Performance
 
 - **Matmul kernels about 5x faster under TCC**, output bit-identical. The scalar
@@ -363,7 +368,8 @@ First public release.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md).
 
-[Unreleased]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/s81/kimi-work-8Gb/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/s81/kimi-work-8Gb/releases/tag/v1.2.0
 [1.1.0-win.1]: https://github.com/s81/kimi-work-8Gb/releases/tag/v1.1.0-win.1
 [1.1.0]: https://github.com/FareedKhan-dev/kimi-k3-in-c/compare/v1.0.0...v1.1.0
