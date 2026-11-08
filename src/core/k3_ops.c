@@ -187,12 +187,25 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
+    /* TCC SHAPE. Every loop below walks j eight at a time through a pointer, with
+     * each element still computed by the same single float operation in the same
+     * order as the plain loops it replaces (see "TCC-shaped dot products"). Two
+     * values are hoisted because they do not depend on i: ki*beta, which the plain
+     * form recomputed per element as the same float product, and v[j]-u[j], the same
+     * float difference for every row. Bit-identical, about 2x faster under TCC. */
+    const int dv8 = dv & ~7;
+
     /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
      *    channel, not a scalar, which is what "channel-wise forget gate" means. */
     for (int i = 0; i < dk; i++) {
-        float *row = S + (size_t)i * dv;
+        float *r = S + (size_t)i * dv;
         const float a = alpha[i];
-        for (int j = 0; j < dv; j++) row[j] *= a;
+        int j = 0;
+        for (; j < dv8; j += 8, r += 8) {
+            r[0] *= a; r[1] *= a; r[2] *= a; r[3] *= a;
+            r[4] *= a; r[5] *= a; r[6] *= a; r[7] *= a;
+        }
+        for (; j < dv; j++, r++) *r *= a;
     }
 
     /* 2. read the state along k:  u = S^T k */
@@ -204,32 +217,47 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
      * engine: once per head per token per KDA layer, which at K3 scale is 96 x 69 =
      * 6,624 calls per token, and k3_kda_layer runs them from a k3_par parallel loop, so a heap
      * temporary here is 6,624 malloc/free pairs per token with sixteen threads
-     * contending for the allocator. dv is 128 for K3, so the array below covers it and
+     * contending for the allocator. dv is 128 for K3, so the arrays below cover it and
      * the heap path is dead code in practice. */
-    float  ubuf[K3_KDA_STEP_DV];
+    float  ubuf[K3_KDA_STEP_DV], dbuf[K3_KDA_STEP_DV];
     float *uheap = NULL;
-    float *u = ubuf;
+    float *u = ubuf, *d = dbuf;
     if (dv > K3_KDA_STEP_DV) {
-        uheap = (float *)calloc((size_t)dv, sizeof(float));
-        if (!uheap) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+        uheap = (float *)calloc((size_t)dv * 2, sizeof(float));
+        if (!uheap) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * 2 * sizeof(float));
         u = uheap;
+        d = uheap + dv;
     } else {
         for (int j = 0; j < dv; j++) u[j] = 0.0f;   /* calloc's zeroing, explicitly */
     }
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) u[j] += ki * row[j];
+        const float *r = S + (size_t)i * dv;
+        float *w = u;
+        int j = 0;
+        for (; j < dv8; j += 8, r += 8, w += 8) {
+            w[0] += ki * r[0]; w[1] += ki * r[1]; w[2] += ki * r[2]; w[3] += ki * r[3];
+            w[4] += ki * r[4]; w[5] += ki * r[5]; w[6] += ki * r[6]; w[7] += ki * r[7];
+        }
+        for (; j < dv; j++, r++, w++) *w += ki * *r;
     }
 
     /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
      *    it a DELTA rule rather than plain accumulation. */
+    for (int j = 0; j < dv; j++) d[j] = v[j] - u[j];
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
-        float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        const float kb = ki * beta;
+        float *r = S + (size_t)i * dv;
+        const float *e = d;
+        int j = 0;
+        for (; j < dv8; j += 8, r += 8, e += 8) {
+            r[0] += kb * e[0]; r[1] += kb * e[1]; r[2] += kb * e[2]; r[3] += kb * e[3];
+            r[4] += kb * e[4]; r[5] += kb * e[5]; r[6] += kb * e[6]; r[7] += kb * e[7];
+        }
+        for (; j < dv; j++, r++, e++) *r += kb * *e;
     }
 
     /* 4. output from the ALREADY UPDATED state: o = S^T q */
@@ -237,8 +265,14 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     for (int i = 0; i < dk; i++) {
         const float qi = q[i];
         if (qi == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) o[j] += qi * row[j];
+        const float *r = S + (size_t)i * dv;
+        float *w = o;
+        int j = 0;
+        for (; j < dv8; j += 8, r += 8, w += 8) {
+            w[0] += qi * r[0]; w[1] += qi * r[1]; w[2] += qi * r[2]; w[3] += qi * r[3];
+            w[4] += qi * r[4]; w[5] += qi * r[5]; w[6] += qi * r[6]; w[7] += qi * r[7];
+        }
+        for (; j < dv; j++, r++, w++) *w += qi * *r;
     }
     free(uheap);                                  /* free(NULL) is a no-op */
 }
@@ -276,6 +310,16 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
 #define K3_X16(M) M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7) \
                   M(8) M(9) M(10) M(11) M(12) M(13) M(14) M(15)
 
+/* CHAINED ADDS. TCC keeps a value in a register only within one expression, so
+ *     a0 = a0 + e(0) + e(16) + e(32) + ... + e(112);
+ * costs one load and one store of a0 per 128 elements instead of one per element. C
+ * evaluates + left to right, so this is ((a0 + e(0)) + e(16)) + ..., exactly the
+ * sequence of separate a0 += e(i) statements: the same additions in the same order,
+ * hence the same bits. Measured with TCC on one core at 12288 x 7168: bf16 rows went
+ * from 87 ms to 63 ms. E(k) names element r[k] times p[k]; define it before use. */
+#define K3_CHAIN8(k) a##k = a##k + K3_E(k) + K3_E((k) + 16) + K3_E((k) + 32) + K3_E((k) + 48) \
+                     + K3_E((k) + 64) + K3_E((k) + 80) + K3_E((k) + 96) + K3_E((k) + 112);
+
 /* Widened copy of x, or NULL if the allocation fails (callers then widen in place). */
 static double *k3_widen(const float *x, int n)
 {
@@ -312,6 +356,10 @@ static void k3_matmul_rows(void *k3_vctx_, int k3_b_, int k3_e_)
         const float *r = row, *const end = row + in16;
         if (xd) {
             const double *p = xd;
+            const float *const end128 = row + (in & ~127);
+#define K3_E(k) (double)r[k] * p[k]
+            for (; r < end128; r += 128, p += 128) { K3_X16(K3_CHAIN8) }
+#undef K3_E
 #define K3_MM_D(k) a##k += (double)r[k] * p[k];
             for (; r < end; r += 16, p += 16) { K3_X16(K3_MM_D) }
 #undef K3_MM_D
@@ -1335,17 +1383,20 @@ static void k3_bf16_rows(void *k3_vctx_, int k3_b_, int k3_e_)
             /* Element i in accumulator i%16, K3_RED16 reduction: the partition and
              * tree of the AVX2/NEON paths and of k3_matmul. bf16 x float is exact in
              * double, so multiply-then-add equals fma (see K3_ACC16). */
-            const double *T = K3_BF16_D;
             K3_ACC16;
             const uint16_t *r = row, *const end = row + (in & ~15);
             if (xd) {
                 const double *p = xd;
-#define K3_BF_D(k) a##k += T[r[k]] * p[k];
+                const uint16_t *const end128 = row + (in & ~127);
+#define K3_E(k) K3_BF16_D[r[k]] * p[k]
+                for (; r < end128; r += 128, p += 128) { K3_X16(K3_CHAIN8) }
+#undef K3_E
+#define K3_BF_D(k) a##k += K3_BF16_D[r[k]] * p[k];
                 for (; r < end; r += 16, p += 16) { K3_X16(K3_BF_D) }
 #undef K3_BF_D
             } else {
                 const float *p = x;
-#define K3_BF_F(k) a##k += T[r[k]] * (double)p[k];
+#define K3_BF_F(k) a##k += K3_BF16_D[r[k]] * (double)p[k];
                 for (; r < end; r += 16, p += 16) { K3_X16(K3_BF_F) }
 #undef K3_BF_F
             }
@@ -1944,6 +1995,20 @@ static void k3_mxfp4_rows(void *k3_vctx_, int k3_b_, int k3_e_)
                     double s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0, s7 = 0;
                     const unsigned char *b = pb;
                     const double *p = xdg;
+                    /* 32 elements as one chained expression per accumulator (see
+                     * K3_CHAIN8): accumulator L = 2j+h takes nibble h of bytes j, j+4,
+                     * j+8, j+12 in that order, the order the 8-wide loop below adds
+                     * them in. Measured with TCC, best of 12 runs, 3072 x 3584: 13.1 to
+                     * 10.3 ms on one thread, 4.1 to 3.25 ms on four. */
+#define K3_MX4(L, j, h) s##L = s##L + K3_E2M1_PAIRD[b[j]][h] * p[2 * (j) + (h)] \
+        + K3_E2M1_PAIRD[b[(j) + 4]][h]  * p[2 * (j) + (h) + 8]                  \
+        + K3_E2M1_PAIRD[b[(j) + 8]][h]  * p[2 * (j) + (h) + 16]                 \
+        + K3_E2M1_PAIRD[b[(j) + 12]][h] * p[2 * (j) + (h) + 24];
+                    for (; i + 31 < n; i += 32, b += 16, p += 32) {
+                        K3_MX4(0, 0, 0) K3_MX4(1, 0, 1) K3_MX4(2, 1, 0) K3_MX4(3, 1, 1)
+                        K3_MX4(4, 2, 0) K3_MX4(5, 2, 1) K3_MX4(6, 3, 0) K3_MX4(7, 3, 1)
+                    }
+#undef K3_MX4
                     for (; i + 7 < n; i += 8, b += 4, p += 8) {
                         const double *d0 = K3_E2M1_PAIRD[b[0]];
                         const double *d1 = K3_E2M1_PAIRD[b[1]];

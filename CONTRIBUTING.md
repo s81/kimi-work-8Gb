@@ -65,7 +65,8 @@ claim. See [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 - **Hot loops are written for TCC**, which does not inline, unroll or keep values in
   registers across statements. Follow "TCC-shaped dot products" in `src/core/k3_ops.c`:
   named accumulators, no function calls per element (`static inline` is still a call
-  under TCC), activations widened to double once per call. Do not "simplify" them back
+  under TCC), activations widened to double once per call, and chained additions
+  (`K3_CHAIN8`) so an accumulator stays in a register for a whole expression. Do not "simplify" them back
   into an indexed array or an `fma()` call; that costs about 5x and changes no result.
   Keep each accumulator partition and reduction tree exactly as it is: the AVX2 and NEON
   paths and the fixtures depend on that order. Check with `tcc -run build.c bench`, whose
