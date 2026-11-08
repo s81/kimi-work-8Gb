@@ -48,13 +48,19 @@ jobs:
           grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY"  /tmp/t.log
           grep -q "ALL WEIGHTLESS TESTS PASSED"                    /tmp/t.log
 
+      # Collect the whole output before inspecting it. Piping straight into
+      # `Select-Object -First 1` stops the pipeline after one line, which cuts k3.exe
+      # off mid-write and leaves a nonzero $LASTEXITCODE even though --help returns 0.
       - name: Smoke-test the packaged executables outside MSYS2
         shell: pwsh
         run: |
           Get-ChildItem dist -Directory | ForEach-Object {
             $exe = Join-Path $_.FullName 'k3.exe'
-            & $exe --help | Select-Object -First 1
-            if ($LASTEXITCODE -ne 0) { throw "$exe --help exited $LASTEXITCODE" }
+            $out = & $exe --help
+            $rc = $LASTEXITCODE
+            if ($rc -ne 0) { throw "$exe --help exited $rc" }
+            if (-not ($out -match '^k3 \d')) { throw "$exe --help printed no version banner" }
+            "$($_.Name): $($out[0])"
           }
 
       - uses: actions/upload-artifact@v4
