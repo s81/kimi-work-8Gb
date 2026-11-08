@@ -85,6 +85,20 @@ Present tense, imperative: `add chunked prefill`, not `added` or `adds`. Explain
 the body; the diff already shows what. Fill in the PR template's verification section;
 it is a checklist, not a formality.
 
+## Releases
+
+1. Open a PR that sets `K3_VERSION` in `src/cli/k3_run.c`, adds
+   `.github/release-notes/v<version>.md`, and moves the CHANGELOG's Unreleased entries
+   under the new version.
+2. Merge it.
+3. Only then create the release on GitHub (Releases, *Draft a new release*, new tag
+   `v<version>` on `main`, empty description). `release.yml` builds and tests on Linux
+   and Windows and attaches both zips, `SHA256SUMS.txt` and the notes file.
+
+Its preflight job refuses a tag that does not match `K3_VERSION` or has no notes file,
+so a release created before step 2 fails without publishing anything. If that happens,
+delete the release and the tag, finish step 2, and create the release again.
+
 ## Scope
 
 Read [docs/ROADMAP.md](docs/ROADMAP.md) first. It also lists what is deliberately *not*

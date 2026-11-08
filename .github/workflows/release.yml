@@ -3,8 +3,16 @@ name: release
 # Pushing a tag v* builds k3 with the Tiny C Compiler on Linux and Windows, runs the
 # full weightless test suite on each, packages each with `tcc -run build.c dist`, and
 # publishes a GitHub Release with both zips, SHA256SUMS.txt, and the notes in
-# .github/release-notes/<tag>.md (GitHub-generated notes when that file is missing).
-# Every push and PR already gets the same zips as CI artifacts (ci.yml).
+# .github/release-notes/<tag>.md. Every push and PR already gets the same zips as CI
+# artifacts (ci.yml).
+#
+# The preflight job refuses a tag that does not match the source before anything is
+# built or published: the tag must be v<K3_VERSION> (optionally followed by -suffix,
+# e.g. v1.2.3-rc1) and must have its notes file. A release created on GitHub before
+# its version-bump PR is merged therefore fails here instead of publishing zips named
+# after the previous version with GitHub's generated notes, which happened to the
+# first v1.2.1 and v1.2.2 attempts. Recovery: delete the release and the tag, merge
+# the PR, create the release again.
 
 on:
   push:
@@ -15,8 +23,39 @@ permissions:
   contents: read
 
 jobs:
+  preflight:
+    name: tag matches source
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tag, K3_VERSION and release notes agree
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          ver=$(sed -n 's/^#define K3_VERSION "\(.*\)"$/\1/p' src/cli/k3_run.c)
+          if [ -z "$ver" ]; then
+            echo "::error::no #define K3_VERSION in src/cli/k3_run.c"
+            exit 1
+          fi
+          case "$TAG" in
+            "v$ver"|"v$ver"-*) ;;
+            *)
+              echo "::error::tag $TAG does not match K3_VERSION $ver at $GITHUB_SHA. The release was probably created before its version-bump PR was merged: delete the release and the tag, merge the PR, then create the release again."
+              exit 1 ;;
+          esac
+          if [ ! -f ".github/release-notes/$TAG.md" ]; then
+            echo "::error::.github/release-notes/$TAG.md is missing at $GITHUB_SHA. Add the notes (with the version bump) before tagging."
+            exit 1
+          fi
+          echo "tag $TAG, K3_VERSION $ver, notes .github/release-notes/$TAG.md: OK"
+
   build:
     name: build + test + package (${{ matrix.os }}, tcc)
+    needs: preflight
+    # preflight is skipped on workflow_dispatch (no tag); build still runs then.
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true

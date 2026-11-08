@@ -5,6 +5,15 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Release preflight.** `release.yml` now refuses a tag that does not match
+  `K3_VERSION` (`v<version>` or `v<version>-suffix`) or that has no
+  `.github/release-notes/<tag>.md`, before anything is built or published. The first
+  v1.2.1 and v1.2.2 releases were created before their version-bump PRs merged, and
+  shipped zips named for the previous version with GitHub's generated notes; that
+  now fails instead. CONTRIBUTING has a *Releases* section with the order to follow.
+
 ## [1.2.2] - 2026-11-08
 
 Linux and Windows x86-64 release with chained-accumulator TCC kernels. Release notes:
