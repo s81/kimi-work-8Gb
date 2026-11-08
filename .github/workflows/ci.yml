@@ -128,7 +128,19 @@ jobs:
       # absent. -static needs the static archive specifically, and the link then fails
       # with "cannot find -lgomp" on a toolchain that otherwise looks complete,
       # confirmed directly rather than assumed.
+      # The runner image ships MSYS2 at C:\msys64; `release: false` uses that copy instead
+      # of downloading the installer, which has failed with HTTP 504 during MSYS2 outages.
+      # If the preinstalled copy is unusable, fall back to a fresh download.
       - uses: msys2/setup-msys2@v2
+        id: msys2
+        continue-on-error: true
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp make
+          release: false
+      - uses: msys2/setup-msys2@v2
+        if: steps.msys2.outcome == 'failure'
         with:
           msystem: MINGW64
           update: true
@@ -160,7 +172,19 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v7
+      # The runner image ships MSYS2 at C:\msys64; `release: false` uses that copy instead
+      # of downloading the installer, which has failed with HTTP 504 during MSYS2 outages.
+      # If the preinstalled copy is unusable, fall back to a fresh download.
       - uses: msys2/setup-msys2@v2
+        id: msys2
+        continue-on-error: true
+        with:
+          msystem: CLANG64
+          update: true
+          install: mingw-w64-clang-x86_64-clang mingw-w64-clang-x86_64-compiler-rt make
+          release: false
+      - uses: msys2/setup-msys2@v2
+        if: steps.msys2.outcome == 'failure'
         with:
           msystem: CLANG64
           update: true
