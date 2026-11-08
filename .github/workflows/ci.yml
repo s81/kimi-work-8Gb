@@ -52,7 +52,7 @@ jobs:
         shell: bash
         run: tcc -run build.c dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: k3-${{ runner.os }}-x64
           path: dist/*.zip
