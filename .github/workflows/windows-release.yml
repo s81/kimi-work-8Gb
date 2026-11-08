@@ -1,0 +1,81 @@
+name: windows-build
+
+# Builds distributable Windows x86-64 binaries (k3.exe) natively on windows-latest with
+# MSYS2's MinGW-w64 GCC, runs the weightless test suite against the AVX2 build, and
+# uploads both zips as workflow artifacts. Pushing a tag v* also attaches them to a
+# GitHub Release. The packaging logic lives in scripts/build-windows.sh so the same
+# zips can be produced locally (MSYS2 or a Linux/WSL cross-compile).
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    name: build windows-x64 (avx2 + generic)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      # mingw-w64-x86_64-libgomp is listed explicitly: it is only an optional
+      # dependency of the gcc package, and the -static link needs its archive.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp make zip
+
+      - name: Build and package both variants
+        run: ./scripts/build-windows.sh
+
+      # Same gate as upstream ci.yml, run against the exact flags shipped in the avx2
+      # zip (portable -mavx2 -mfma, not -march=native). GitHub's Windows runners have
+      # AVX2. Tokenizer parity is skipped, as in upstream CI: it needs the real model's
+      # tiktoken.model.
+      - name: Weightless test suite (avx2 build)
+        run: |
+          make ARCH="-mavx2 -mfma" BUILD=build-win-avx2 BIN=bin-win-avx2 test 2>&1 | tee /tmp/t.log
+          grep -q "22 passed, 0 failed, 0 skipped"                 /tmp/t.log
+          grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY"  /tmp/t.log
+          grep -q "ALL WEIGHTLESS TESTS PASSED"                    /tmp/t.log
+
+      - name: Smoke-test the packaged executables outside MSYS2
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -Directory | ForEach-Object {
+            $exe = Join-Path $_.FullName 'k3.exe'
+            & $exe --help | Select-Object -First 1
+            if ($LASTEXITCODE -ne 0) { throw "$exe --help exited $LASTEXITCODE" }
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k3-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: attach zips to the GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows-x64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: k3-windows-x64
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          fail_on_unmatched_files: true
