@@ -1,0 +1,20 @@
+{
+  "metadata": {
+    "total_size": 42,
+    "note": "Miniature stand-in for the Hub's model.safetensors.index.json, shaped so a plausible wrong mapper fails. Layer 0 is split across shards 1 AND 2 (a first-shard-per-layer lookup misses half of it), layer 1 lives wholly in shard 3 (a first-K-shards guess is wrong in both directions), shard 4 holds only a far-future layer and a vision tensor (an implementation that returns every shard, or every non-layer tensor, passes nothing), and shard 5 holds the final norm and output AttnRes tensors apart from the embedding and head (a mapper that follows only embed and head misses it)."
+  },
+  "weight_map": {
+    "language_model.model.embed_tokens.weight": "model-00001-of-00005.safetensors",
+    "language_model.lm_head.weight": "model-00001-of-00005.safetensors",
+    "language_model.model.layers.0.input_layernorm.weight": "model-00001-of-00005.safetensors",
+    "language_model.model.layers.0.mlp.weight": "model-00002-of-00005.safetensors",
+    "language_model.model.layers.1.input_layernorm.weight": "model-00003-of-00005.safetensors",
+    "language_model.model.layers.1.mlp.weight": "model-00003-of-00005.safetensors",
+    "language_model.model.layers.2.input_layernorm.weight": "model-00003-of-00005.safetensors",
+    "language_model.model.layers.7.mlp.weight": "model-00004-of-00005.safetensors",
+    "language_model.model.norm.weight": "model-00005-of-00005.safetensors",
+    "language_model.model.output_attn_res_norm.weight": "model-00005-of-00005.safetensors",
+    "language_model.model.output_attn_res_proj.weight": "model-00005-of-00005.safetensors",
+    "vision_tower.patch_embed.proj.weight": "model-00004-of-00005.safetensors"
+  }
+}

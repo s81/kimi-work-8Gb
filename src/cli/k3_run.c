@@ -1,0 +1,2143 @@
+/* k3_run.c - run the REAL Kimi K3, all 93 layers, from the released checkpoint.
+ *
+ * WHAT THIS IS
+ *   The full engine: safetensors index over 96 shards, resident trunk bound by name,
+ *   routed experts streamed from disk through an LRU cache and multiplied straight out
+ *   of MXFP4. Greedy decode. Token ids in, token ids out.
+ *
+ * MEMORY. The banner this program prints before allocating is a PLAN, not a measurement.
+ *   It reports requested budgets rather than actual reservations, and in practice it
+ *   OVERSTATES: across the 12-rung ladder in docs/data/ the planned total exceeded
+ *   measured peak RSS by 0.13-1.84 GB, because both budgets round down to whole slots and
+ *   that rounding outweighs the safetensors index it omits. Quote the "PEAK RSS" line
+ *   instead, which comes from
+ *   getrusage after the run. Fully resident, the weights are 108.81 GB of bf16 trunk plus
+ *   4.70 GB of embed and lm_head, so 113.49 GB; streamed, the resident set is whatever
+ *   budget is given, down to about 8.2 GB. The 1.45 TB of routed experts is never
+ *   resident at any budget.
+ *
+ * THIS ENGINE IS I/O BOUND at small budgets and roughly balanced at large ones. The
+ *   measured I/O share runs 40.9%-60.6% across the 12-rung ladder (docs/data/), dropping
+ *   below 50% at 96 GB and above. The "I/O share" line printed at the end of every run
+ *   reports it for that run. Going faster still means moving fewer bytes before it means
+ *   computing less, which is why docs/TUNING.md is mostly about allocation.
+ *
+ * DECODE STRATEGY
+ *   By default each step re-runs the whole prefix rather than carrying state forward.
+ *   That is O(T^2), but it is the path the full-model oracle validates in
+ *   tests/unit/k3_model.c. --incremental switches to prefill-then-one-token-at-a-time,
+ *   carrying the KDA recurrent state and an MLA KV cache. GATE 3 of the tiny-model
+ *   oracle requires it to produce the SAME tokens as full recompute, so the equivalence
+ *   is tested rather than assumed. Context is limited by the MLA KV cache
+ *   (~2.37 MB/position), not by array sizes; the engine computes the requirement up
+ *   front and refuses the run if it will not fit.
+ *
+ * COMMAND LINE
+ *   usage() below is the single source of truth for options and defaults; `k3 --help`
+ *   prints it. It is not duplicated here, because a second copy is a second thing to
+ *   keep correct and the copy is the one that goes stale.
+ */
+#define _POSIX_C_SOURCE 200809L
+/* _POSIX_C_SOURCE alone hides the BSD rusage fields, ru_maxrss among them, from
+ * <sys/resource.h> on Darwin. peak_rss_bytes() below needs it. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
+
+#include <math.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <sys/resource.h>
+#endif
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#include "k3_portable_io.h"   /* getline() shim for MinGW; see the header for why */
+#include "k3.h"
+#include "k3_bind.h"
+#include "k3_cache.h"
+#include "k3_trunk.h"
+#include "k3_tok.h"   /* text in/out; the --ids path never touches it */
+#include "k3_chat.h"
+#include "k3_prefix.h"
+#include "k3_sampler.h"
+#include "k3_cfg.h"   /* read the checkpoint's own config rather than assuming it */
+#include "k3_cancel.h" /* first Ctrl-C stops at a safe point; see the header */
+#include "k3_state.h" /* --save-state / --load-state file format */
+#include "k3_sysmem.h" /* available/total memory on Linux, Darwin and Windows */
+
+static double now_s(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+static void human(double b, char *o, size_t n)
+{
+    const char *u[] = {"B", "KB", "MB", "GB", "TB"};
+    int i = 0; while (b >= 1000.0 && i < 4) { b /= 1000.0; i++; }
+    snprintf(o, n, "%.2f %s", b, u[i]);
+}
+
+/* The released constants, kept ONLY as a fallback for runs against a shard directory
+ * that has no config.json (partial fixtures, hand-assembled trunks). Every value here
+ * matches the released config.json, but a hardcoded table cannot notice a checkpoint
+ * revision -- so k3_cfg_load_file() is preferred whenever a config is present, and this
+ * path announces itself loudly rather than passing for the real thing. */
+static void real_cfg_hardcoded(K3Cfg *c, int *fa)
+{
+    memset(c, 0, sizeof *c);
+    c->hidden = 7168;  c->n_layers = 93;   c->vocab = 163840; c->rms_eps = 1e-5f;
+    c->kda_heads = 96; c->kda_head_dim = 128; c->conv_k = 4;  c->gate_lb = -5.0f;
+    c->n_heads = 96;   c->q_lora = 1536;   c->kv_lora = 512;
+    c->qk_nope = 128;  c->qk_rope = 64;    c->v_head = 128;   c->mla_out_gate = 1;
+    c->n_experts = 896; c->topk = 16;      c->n_shared = 2;
+    c->latent = 3584;  c->moe_inter = 3072; c->routed_scale = 1.0f;
+    c->moe_renorm = 1; c->latent_norm = 1;
+    c->first_dense = 1; c->dense_inter = 33792;
+    c->attn_res_block = 12;
+    c->situ_b1 = 4.0f; c->situ_b2 = 25.0f;
+    int n = 0;
+    for (int i = 4; i <= 93; i += 4) fa[n++] = i;     /* config lists are ONE-based */
+    fa[n++] = 93;
+    c->n_full_attn = n; c->full_attn = fa;
+}
+
+/* Prefer the checkpoint's own config; fall back only when there is none.
+ * cfg_path may be NULL, in which case <shard_dir>/config.json is tried.
+ * Returns 1 on success, 0 if a config was found but could not be trusted -- and in
+ * that case the caller MUST abort rather than fall back: a config that was found but
+ * could not be parsed is evidence that the checkpoint is not what the fallback table
+ * describes, which is exactly when the fallback is most dangerous. */
+static int real_cfg(K3Cfg *c, int *fa, int fa_max,
+                    const char *shard_dir, const char *cfg_path)
+{
+    char guess[4096];
+    if (!cfg_path) {
+        snprintf(guess, sizeof guess, "%s/config.json", shard_dir);
+        FILE *probe = fopen(guess, "rb");
+        if (probe) { fclose(probe); cfg_path = guess; }
+    }
+    if (cfg_path) return k3_cfg_load_file(c, fa, fa_max, cfg_path);
+
+    real_cfg_hardcoded(c, fa);
+    printf("config: NO config.json found under %s\n"
+           "        falling back to the built-in Kimi K3 constants (93 layers, 24 MLA).\n"
+           "        These match the released checkpoint but are NOT read from it; pass\n"
+           "        --config PATH to validate against the real file.\n", shard_dir);
+    return 1;
+}
+
+static int argmax_(const float *v, int n)
+{ int b = 0; for (int i = 1; i < n; i++) if (v[i] > v[b]) b = i; return b; }
+
+static void json_string(FILE *f, const char *s)
+{
+    if (!s) { fputs("null", f); return; }
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+        case '"': fputs("\\\"", f); break;
+        case '\\': fputs("\\\\", f); break;
+        case '\b': fputs("\\b", f); break;
+        case '\f': fputs("\\f", f); break;
+        case '\n': fputs("\\n", f); break;
+        case '\r': fputs("\\r", f); break;
+        case '\t': fputs("\\t", f); break;
+        default:
+            if (*p < 0x20) fprintf(f, "\\u%04x", (unsigned)*p);
+            else fputc(*p, f);
+        }
+    }
+    fputc('"', f);
+}
+
+#define K3_SPEC_MAX 8
+/* Longest-suffix n-gram drafting for --spec: if the last n ids (n=3, then 2) already
+ * appeared earlier in the sequence, propose the ids that followed them there. Costs
+ * nothing when it misses: no draft means the step runs exactly as without --spec. The
+ * drafts are PROPOSALS only; batched greedy verification accepts precisely the prefix
+ * the model itself would have emitted, so the output stream is identical to serial
+ * decode by construction, and the A/B gate checks it. */
+
+static int spec_draft(const int *seq, int T, int cap, int *out)
+{
+    /* Evidence-gated: a draft only fires when the suffix n-gram's occurrences AGREE on
+     * what follows. Measured on the released checkpoint, an eager most-recent-match
+     * drafter went 0.91x on code: partial acceptances pay a replay sweep, so weak
+     * drafts are worse than no drafts. Rules: match length 4 (then 3); if the n-gram
+     * occurred more than once, every occurrence must propose the same next id, and the
+     * draft stops at the first position where historical continuations diverge. */
+    if (cap > K3_SPEC_MAX) cap = K3_SPEC_MAX;
+    for (int n = 4; n >= 3; n--) {
+        if (T < n + 1) continue;
+        int m1 = -1, m2 = -1;                            /* two most recent matches */
+        for (int j = T - n - 1; j >= 0; j--) {
+            int hit = 1;
+            for (int i = 0; i < n; i++)
+                if (seq[j + i] != seq[T - n + i]) { hit = 0; break; }
+            if (!hit) continue;
+            if (m1 < 0) m1 = j;
+            else { m2 = j; break; }
+        }
+        if (m1 < 0) continue;
+        int nd = 0;
+        for (int i = 0; nd < cap && m1 + n + i < T; i++) {
+            const int cand = seq[m1 + n + i];
+            if (m2 >= 0) {
+                /* stop where the two histories stop agreeing */
+                if (m2 + n + i >= m1 || seq[m2 + n + i] != cand) break;
+            }
+            out[nd++] = cand;
+        }
+        if (nd > 0) return nd;
+    }
+    return 0;
+}
+
+#ifndef K3_VERSION
+#define K3_VERSION "1.1.0"
+#endif
+
+/* The fraction of available memory a plan is allowed to occupy. The admission check and
+ * the auto budget MUST use the same number: auto sized itself to 98% of available while
+ * the check refused anything above 95%, and auto's flat 2 GB margin cannot cover that 3%
+ * gap once the machine is large. The effect was that auto always refused inside its own
+ * full-residency branch -- the case that branch calls "the configuration auto exists
+ * for" -- because entering it needs ~122 GB available, and by then 3% is over 3.7 GB. */
+#define K3_MEM_ADMIT 0.95
+
+#ifdef _OPENMP
+/* Physical cores, or 0 when the topology cannot be read.
+ *
+ * OpenMP's default is one thread per LOGICAL cpu, which on an SMT part is twice the core
+ * count. This workload loses badly at that setting: on a 16-core/32-thread machine the
+ * unbound 32-thread default measured 7.41 s/token against 5.63 at 16, because 32 threads
+ * migrating across two CCDs destroy locality on a 100+ GB working set. Counting cores
+ * needs the sibling topology; nothing in the C standard exposes it.
+ *
+ * A cpu is counted when it is the lowest-numbered member of its own sibling list, which
+ * yields exactly one cpu per physical core. */
+static int k3_physical_cores(void)
+{
+#if defined(__linux__)
+    int cores = 0;
+    for (int cpu = 0; cpu < 4096; cpu++) {
+        char path[128];
+        snprintf(path, sizeof path,
+                 "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+        FILE *f = fopen(path, "r");
+        if (!f) {
+            if (cpu == 0) return 0;   /* no topology at all: caller keeps the default */
+            break;                    /* ran off the end of the online cpus */
+        }
+        int first = -1;
+        if (fscanf(f, "%d", &first) == 1 && first == cpu) cores++;
+        fclose(f);
+    }
+    return cores;
+#else
+    return 0;
+#endif
+}
+#endif /* _OPENMP */
+
+static void usage(FILE *f)
+{
+    fprintf(f,
+"k3 " K3_VERSION ", Kimi K3 inference engine\n"
+"\n"
+"usage: k3 <model_dir> [options]\n"
+"\n"
+"prompt (exactly one):\n"
+"  --prompt TEXT         tokenize TEXT and run it\n"
+"  --prompt-file PATH    read the prompt from a file; use this for non-ASCII, since\n"
+"                        argv is re-encoded by the shell\n"
+"  --ids 1,2,3           raw token ids; the reproducible channel used by the tests\n"
+"\n"
+"memory:\n"
+"  --preset NAME         auto | ultra | laptop | desktop | workstation | server | max\n"
+"                        auto sizes both budgets from this machine's free RAM,\n"
+"                        trunk-first; also spelled --trunk-gb auto\n"
+"  --list-presets        show each preset's split and expected speed\n"
+"  --trunk DIR           packed trunk directory; enables streaming (see scripts/)\n"
+"  --trunk-gb X          trunk ring / pinned-layer budget\n"
+"  --trunk-ring N        streaming ring slots (default 2). One slot is the layer being\n"
+"                        computed on, the rest are reads in flight. A third slot lets\n"
+"                        the reader run a layer further ahead and costs one more slot\n"
+"                        of RAM; the budget still wins if it does not fit\n"
+"  --cache-gb X          routed-expert cache budget\n"
+"  --threads N           OpenMP threads. Default is the physical core count, not the\n"
+"                        logical cpu count OpenMP would otherwise pick: on an SMT part\n"
+"                        the extra threads migrate across cores and cost more than they\n"
+"                        add. OMP_NUM_THREADS, if set, still wins\n"
+"  --ultra-low-memory    stream embedding rows and lm_head chunks, and reuse one\n"
+"                        recurrent-state slot during full recompute; needs --trunk\n"
+"\n"
+"generation:\n"
+"  --gen N               tokens to generate (default 8)\n"
+"  --stop-id N           halt after emitting token id N (repeatable, up to 8). The\n"
+"                        stop id is kept in the sequence, so --save-state and a later\n"
+"                        --load-state continue from what was actually produced.\n"
+"                        Off by default: without it --gen N means exactly N tokens,\n"
+"                        which the benchmarks and oracle gates rely on. Note the\n"
+"                        released checkpoint declares TWO end ids that disagree:\n"
+"                        config.json says 163586 (<|end_of_msg|>), tokenizer_config\n"
+"                        .json says 163585 ([EOS]), and the model emits 163585.\n"
+"                        Pass both to stop on either\n"
+"  --incremental         carry KV cache and recurrent state between tokens\n"
+"  --save-state PATH     write the carried state after the run, so the next turn of a\n"
+"                        conversation resumes instead of re-reading the whole prompt\n"
+"  --load-state PATH     resume from a saved state; the prompt given now is treated as\n"
+"                        the CONTINUATION of the saved sequence. Needs --incremental\n"
+"  --draft-trunk DIR     hybrid decode: a second packed trunk (typically a quantized\n"
+"                        derivation of the real one, see tools/qdq_trunk.py) DRAFTS\n"
+"                        tokens which the exact model verifies in batched sweeps.\n"
+"                        Output remains exactly the exact model's greedy decode; the\n"
+"                        draft only proposes. Needs --incremental; implies --spec 4\n"
+"  --draft-trunk-gb X    trunk budget for the draft model (default 6)\n"
+"  --spec N              speculative decode: draft up to N tokens by n-gram lookup and\n"
+"                        verify them in ONE batched sweep. Output is identical to\n"
+"                        serial decode by construction; needs --incremental. An extra\n"
+"                        verified position costs ~22%% of a serial token when the trunk\n"
+"                        streams, so repetitive text decodes up to several times faster\n"
+"  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
+"\n"
+"chat (text-only Kimi K3 XTML):\n"
+"  --chat                terminal REPL; uses the official XTML template. With\n"
+"                        --incremental each turn prefills only what the previous\n"
+"                        turn did not already feed the model\n"
+"  --system TEXT         initial system message (stored in --history)\n"
+"  --history PATH        portable JSONL transcript; rebuilt on restart\n"
+"  --temperature X       turn chat sampling on, at this temperature (default: greedy)\n"
+"  --top-p P             nucleus probability for chat sampling (default 0.95)\n"
+"  --top-k K             only the K most probable tokens stay eligible (default: off)\n"
+"  --seed N              chat sampling seed; any of these four turns sampling on\n"
+"  --greedy              force argmax even when a sampling flag was given\n"
+"  --no-think            answer in the response channel directly: no think channel and\n"
+"                        no thinking-effort message (the encoder's thinking=False)\n"
+"  --thinking-effort E   low, high or max (default max, as the checkpoint's tokenizer sets)\n"
+"\n"
+"diagnostics:\n"
+"  --config PATH         model config; defaults to <model_dir>/config.json\n"
+"  --layers N            bind only the first N layers (partial shard sets)\n"
+"  --dump-logits PATH    write float32 logits for the first step\n"
+"  --dump-cache-trace D  write expert_hist.json and expert_trace.bin into D, for\n"
+"                        offline analysis with tools/sim_cache.py\n"
+"  --out FILE            JSON results (default k3_run.json)\n"
+"  --version, --help\n"
+"\n"
+"Memory is a dial, not a floor: the same model runs in 8 GB and in 224 GB and produces\n"
+"identical output. Give memory to the trunk before the expert cache, see\n"
+"docs/TUNING.md for why, and scripts/k3-doctor.sh to size this machine.\n");
+}
+
+/* ------------------------------------------------------------------- presets ----
+ * Named memory budgets, so a user does not have to discover the trunk/cache split
+ * empirically.
+ *
+ * The split is not arbitrary and it is not symmetric. Per token the engine re-reads the
+ * ENTIRE 108.81 GB trunk but only ~25.8 GB of routed experts, so a gigabyte given to the
+ * trunk removes roughly 1.17 GB/token of guaranteed traffic (one pinned layer) while a
+ * gigabyte given to the expert cache removes, below about 36 GB of arena, nothing
+ * measurable, K3's router is trained for flat expert usage, which defeats an LRU.
+ *
+ * Measured consequence: at a fixed 128 GB budget, trunk-first runs 1.69x faster than
+ * cache-first. So every preset fills the trunk before it feeds the cache.
+ * docs/PERFORMANCE.md carries the data and the noise floor that bounds it. */
+typedef struct {
+    const char *name;
+    double trunk_gb, cache_gb;
+    int ultra;
+    const char *note;
+} K3Preset;
+
+/* The trunk/cache figures are BUDGETS passed to the two allocators. The description
+ * quotes measured peak RSS for the whole process, which is the number that decides
+ * whether a machine can run the preset, it includes the safetensors index, the KV
+ * cache and scratch, none of which appear in either budget. Measured on the reference
+ * machine in docs/PERFORMANCE.md; expect a little variation elsewhere. */
+static const K3Preset K3_PRESETS[] = {
+    { "ultra",       2.5,  0.31, 1,
+      "~3 GB planned: streamed model tables, one state slot. Slow." },
+    { "laptop",      3.0,   1.0, 0, "8.2 GB peak RSS. The ordinary-path floor." },
+    { "desktop",    16.0,  10.0, 0, "31.9 GB peak RSS." },
+    { "workstation", 60.0, 30.0, 0,
+      "95.5 GB peak RSS; the expert cache starts to matter here." },
+    { "server",     110.0, 13.0, 0,
+      "~128 GB peak RSS; 90 of 93 trunk layers pinned. Fastest." },
+    { "max",        110.0,109.0, 0,
+      "~224 GB peak RSS; trunk pinned and a large expert cache." },
+};
+enum { K3_NPRESET = (int)(sizeof K3_PRESETS / sizeof K3_PRESETS[0]) };
+
+static const K3Preset *k3_preset_find(const char *name)
+{
+    for (int i = 0; i < K3_NPRESET; i++)
+        if (!strcmp(name, K3_PRESETS[i].name)) return &K3_PRESETS[i];
+    return NULL;
+}
+
+static void k3_preset_list(FILE *f)
+{
+    fprintf(f, "presets (trunk / expert-cache, in GB):\n");
+    for (int i = 0; i < K3_NPRESET; i++)
+        fprintf(f, "  %-12s %6.2f / %-6.2f  %s\n", K3_PRESETS[i].name,
+                K3_PRESETS[i].trunk_gb, K3_PRESETS[i].cache_gb, K3_PRESETS[i].note);
+    fprintf(f, "  %-12s %6s / %-6s  %s\n", "auto", "fit", "fit",
+            "sizes both from this machine's free RAM, trunk-first. Recommended.");
+    fprintf(f, "\nAll presets stream the trunk, so they need --trunk <packed_dir>.\n"
+               "Run scripts/k3-doctor.sh to see which one this machine fits.\n");
+}
+
+/* PEAK resident set, in bytes. ru_maxrss is kilobytes on Linux and BYTES on Darwin, so
+ * the scale factor differs by platform; applying the Linux one on macOS would overstate
+ * the peak by 1024x.
+ *
+ * This is the authoritative memory figure. The banner printed before allocation is a
+ * PLAN and understates: it omits the safetensors index (~78 MB at full scale), reports
+ * requested budgets rather than actual reservations, and cannot observe fragmentation.
+ * Quote this value, not the plan. */
+static double peak_rss_bytes(void)
+{
+#ifdef _WIN32
+    /* PeakWorkingSetSize is Windows' peak-RSS equivalent, already in bytes -- no
+     * kilobyte scaling needed, unlike ru_maxrss on Linux. */
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) return 0.0;
+    return (double)pmc.PeakWorkingSetSize;
+#else
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0.0;
+#if defined(__APPLE__)
+    return (double)ru.ru_maxrss;            /* already bytes */
+#else
+    return (double)ru.ru_maxrss * 1024.0;   /* kilobytes */
+#endif
+#endif
+}
+
+typedef struct {
+    K3LayerBind *lay;
+    K3ModelBind  mb;
+    K3ModelStream ms;
+    int          n_bound;
+    int          layers_completed;
+    int          ultra;
+    K3Trunk     *trunk;      /* non-NULL when the trunk is streamed rather than resident */
+    /* Incremental decode state. Only MLA layers need a KV cache, so the 24 of them are
+     * numbered densely rather than indexing all 93 and wasting 74% of the allocation. */
+    float       *kvc, *ropec;
+    int         *mla_slot;   /* [n_layers] -> dense MLA index, or -1 */
+    int          n_mla, kv_cap, cached;
+    int          draft_mode;   /* 1 for the hybrid draft: cache-only expert routing */
+} Weights;
+
+/* One full forward over T tokens, writing logits for the LAST position only. Every
+ * step rebuilds state from scratch, matching the path the oracle validates.
+ *
+ * Returns 0 on success and -1 if the forward could not be completed. The caller MUST
+ * check: on failure logits_last is left untouched, and argmaxing an untouched buffer
+ * yields a token drawn from uninitialised memory, printed as though it were output. */
+/* arg_all: when non-NULL, receives argmax(logits) for EVERY position 0..T-1, which is
+ * what batched greedy verification consumes. logits_last still gets the final position's
+ * full vector either way. The extra cost is one lm_head matmul per additional position,
+ * pure RAM-resident compute; measured, an extra verified position costs ~22% of a serial
+ * token at streamed-trunk budgets, which is the entire economics of --spec. */
+static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, int T,
+                   float *logits_last, float *scratch, float *h, float *br, float *kstate,
+                   int *arg_all)
+{
+    const int E = c->hidden;
+    const int maxb = c->n_layers / c->attn_res_block + 2;
+    const int P = c->kda_heads * c->kda_head_dim;
+    const size_t kper = (size_t)P * c->kda_head_dim + (size_t)3 * P * (c->conv_k - 1);
+
+    for (int t = 0; t < T; t++) {
+        if (w->ultra) {
+            if (k3_model_stream_embed_row(&w->ms, h + (size_t)t * E, ids[t]) != 0) {
+                fprintf(stderr, "embedding row load failed for token %d at position %d\n",
+                        ids[t], t);
+                return -1;
+            }
+        } else {
+            k3_embed_row(h + (size_t)t * E, w->mb.embed, w->mb.wdt, ids[t], E);
+        }
+    }
+
+    memset(br, 0, (size_t)T * maxb * E * sizeof(float));
+    /* Incremental decode carries the KDA recurrent matrix and ShortConv history across
+     * steps, so it must NOT be cleared here; the full-recompute path rebuilds from
+     * scratch every step and must be. */
+    if (!w->kvc) {
+        const size_t slots = w->ultra ? 1u : (size_t)w->n_bound;
+        memset(kstate, 0, kper * slots * sizeof(float));
+    }
+    w->layers_completed = 0;
+    int nb = 0;
+    for (int L = 0; L < w->n_bound; L++) {
+        /* Streaming: bring this layer in, and hint the next one so its read overlaps
+         * this layer's arithmetic. The order is fixed 0..92 every token, so the hint is
+         * never wrong. */
+        if (w->trunk) {
+            if (k3_trunk_bind(w->trunk, c, L, &w->lay[L]) != 0) {
+                fprintf(stderr, "trunk bind failed at layer %d\n", L);
+                return -1;
+            }
+            k3_trunk_prefetch(w->trunk, L + 1);
+        }
+        /* Point this layer's MoE at the cache before use. Doing it here rather than at
+         * bind time keeps K3LayerBind independent of any particular cache. */
+        if (w->lay[L].lay.moe) {
+            w->lay[L].moe.src = &cache->src;
+            w->lay[L].moe.layer = L;
+            /* The draft routes only among resident experts, reading zero new expert bytes;
+             * the exact model keeps true routing. This is what makes a draft step cheap. */
+            w->lay[L].moe.cache_only = w->draft_mode;
+        }
+        /* Full recompute consumes a layer's KDA/ShortConv state only while that layer is
+         * executing over the complete sequence. Once the layer returns, no later layer
+         * can observe it, so ultra mode may clear and reuse one slot. Incremental decode
+         * still needs one persistent slot per layer and therefore never takes this
+         * path. */
+        float *layer_state = kstate + ((w->ultra && !w->kvc) ? 0 : kper * (size_t)L);
+        if (w->ultra && !w->kvc)
+            memset(layer_state, 0, kper * sizeof(float));
+        const long drops_before = k3_expert_drops;
+        if (w->kvc && w->mla_slot[L] >= 0) {
+            const size_t kvper = (size_t)w->kv_cap * c->n_heads * (c->qk_nope + c->v_head);
+            const size_t rpper = (size_t)w->kv_cap * c->qk_rope;
+            const int mi = w->mla_slot[L];
+            k3_decoder_layer_inc(h, br, &nb, &w->lay[L].lay, c, L, T,
+                                 layer_state, scratch,
+                                 w->kvc + kvper * (size_t)mi,
+                                 w->ropec + rpper * (size_t)mi,
+                                 w->cached, w->kv_cap);
+        } else {
+            k3_decoder_layer_inc(h, br, &nb, &w->lay[L].lay, c, L, T,
+                                 layer_state, scratch,
+                                 NULL, NULL, 0, 0);
+        }
+        if (k3_expert_drops != drops_before) {
+            fprintf(stderr, "routed expert load failed at layer %d; refusing partial "
+                            "MoE output\n", L);
+            return -1;
+        }
+        w->layers_completed = L + 1;
+    }
+
+    /* The model-level aggregator, beyond the two per layer. Exactly one pair exists in
+     * the checkpoint; skipping it is silent. */
+    if (w->mb.out_res_norm && w->mb.out_res_proj) {
+        float *fold = scratch;
+        float *src  = fold + E;
+        for (int i = 0; i < E; i++) fold[i] = w->mb.out_res_norm[i] * w->mb.out_res_proj[i];
+        for (int t = 0; t < T; t++) {
+            for (int b = 0; b < nb; b++)
+                memcpy(src + (size_t)b * E, br + ((size_t)t * maxb + b) * E,
+                       (size_t)E * sizeof(float));
+            memcpy(src + (size_t)nb * E, h + (size_t)t * E, (size_t)E * sizeof(float));
+            k3_attn_res(h + (size_t)t * E, src, fold, nb + 1, E, c->rms_eps);
+        }
+    }
+
+    float *nrm = scratch;
+    if (arg_all) {
+        for (int t = 0; t < T; t++) {
+            k3_rmsnorm(nrm, h + (size_t)t * E, w->mb.norm, E, c->rms_eps);
+            if (w->ultra) {
+                if (k3_model_stream_project(&w->ms, logits_last, nrm) != 0) return -1;
+            } else {
+                k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
+            }
+            arg_all[t] = argmax_(logits_last, c->vocab);
+        }
+        /* logits_last now holds the FINAL position's vector, same as the plain path. */
+        return 0;
+    }
+    k3_rmsnorm(nrm, h + (size_t)(T - 1) * E, w->mb.norm, E, c->rms_eps);
+    if (w->ultra) {
+        if (k3_model_stream_project(&w->ms, logits_last, nrm) != 0) return -1;
+    } else {
+        k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
+    }
+    return 0;
+}
+
+/* ----------------------------------------------------------------------- chat ----
+ * Chat deliberately owns only transcript and decode policy.  It calls the exact same
+ * forward() and streamed K3Cache as batch mode, so --preset/--trunk-gb/--cache-gb keep
+ * their meanings.  With --incremental a turn keeps the KV cache and recurrent state it
+ * built, and the next turn prefills only its new tail when the rendered transcript
+ * begins with exactly the ids that state was fed (src/chat/k3_prefix.h); any divergence,
+ * including /reset, starts over.  GATE 3b of tests/unit/k3_model.c holds the reused path
+ * bit-identical to a full prefill.  Full recompute (no --incremental) carries no state
+ * and still re-runs the whole transcript every step. */
+static int chat_read_line(char **out)
+{
+    char *line = NULL; size_t cap = 0;
+    printf("user> "); fflush(stdout);
+    if (getline(&line, &cap, stdin) < 0) { free(line); return 0; }
+    size_t n = strlen(line);
+    while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+    *out = line; return 1;
+}
+
+static int chat_render_ids(Tok *tok, const K3ChatHistory *history, const K3ChatOptions *opts,
+                           int **ids_out, int *n_out, char *err, size_t err_n)
+{
+    K3ChatSegments segs;
+    if (k3_chat_render_opts(history, 1, opts, &segs, err, err_n) != 0) return -1;
+    /* One sentinel slot distinguishes a prompt exactly at the engine limit from one
+     * that the tokenizer would otherwise silently truncate. */
+    int *ids = (int *)malloc((size_t)(K3_MAX_PROMPT + 1) * sizeof(*ids));
+    if (!ids) { k3_chat_segments_free(&segs); snprintf(err, err_n, "OOM allocating chat prompt"); return -1; }
+    int n = k3_chat_encode(tok, &segs, ids, K3_MAX_PROMPT + 1, err, err_n);
+    k3_chat_segments_free(&segs);
+    if (n <= 0 || n > K3_MAX_PROMPT) {
+        free(ids);
+        if (n == 0) snprintf(err, err_n, "rendered chat prompt has no tokens");
+        else if (n > K3_MAX_PROMPT) snprintf(err, err_n, "rendered chat prompt exceeds the %d-token engine context limit", K3_MAX_PROMPT);
+        return -1;
+    }
+    *ids_out = ids; *n_out = n; return 0;
+}
+
+static int chat_resize(int want, int *tmax, int nl, int maxb, size_t kper,
+                       Weights *w, const K3Cfg *c,
+                       float **h, float **br, float **sc, int **seq)
+{
+    if (want <= *tmax) return 0;
+    const int E = c->hidden;
+    size_t sc_need = k3_layer_scratch(c, want);
+    size_t inc_need = k3_mla_scratch_cached(c, want, want, 1);
+    if (inc_need > sc_need) sc_need = inc_need;
+    float *nh = (float *)malloc((size_t)want * E * sizeof(*nh));
+    float *nb = (float *)malloc((size_t)want * maxb * E * sizeof(*nb));
+    float *ns = (float *)malloc(sc_need * sizeof(*ns));
+    int *nq = (int *)malloc((size_t)(want + 8) * sizeof(*nq));
+    float *nk = NULL, *nr = NULL;
+    const size_t kvrow = (size_t)c->n_heads * (c->qk_nope + c->v_head);
+    const size_t kvper = (size_t)want * kvrow;
+    const size_t rpper = (size_t)want * c->qk_rope;
+    if (w->kvc) {
+        nk = (float *)calloc(kvper * (size_t)w->n_mla, sizeof(*nk));
+        nr = (float *)calloc(rpper * (size_t)w->n_mla, sizeof(*nr));
+    }
+    if (!nh || !nb || !ns || !nq || (w->kvc && (!nk || !nr))) {
+        free(nh); free(nb); free(ns); free(nq); free(nk); free(nr);
+        fprintf(stderr, "chat: buffer allocation failed for %d positions\n", want); return -1;
+    }
+    free(*h); free(*br); free(*sc); free(*seq);
+    *h = nh; *br = nb; *sc = ns; *seq = nq;
+    if (w->kvc) {
+        /* Grow by COPYING the positions already cached: they are what the next turn
+         * reuses. Rows are [pos][H][kvd] per MLA layer, so the per-layer stride changes
+         * with the capacity and the copy is one memcpy per layer, not one for the lot. */
+        const size_t old_kv = (size_t)w->kv_cap * kvrow;
+        const size_t old_rp = (size_t)w->kv_cap * c->qk_rope;
+        const size_t keep = (size_t)(w->cached > 0 ? w->cached : 0);
+        for (int mi = 0; mi < w->n_mla; mi++) {
+            memcpy(nk + (size_t)mi * kvper, w->kvc + (size_t)mi * old_kv,
+                   keep * kvrow * sizeof(*nk));
+            memcpy(nr + (size_t)mi * rpper, w->ropec + (size_t)mi * old_rp,
+                   keep * (size_t)c->qk_rope * sizeof(*nr));
+        }
+        free(w->kvc); free(w->ropec); w->kvc = nk; w->ropec = nr; w->kv_cap = want;
+    }
+    *tmax = want;
+    (void)nl; (void)kper;
+    return 0;
+}
+
+static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history,
+                    const K3ChatOptions *opts, const char *history_path, int **prompt_ref, int np, int gen,
+                    int incremental, int greedy, double temperature, double top_p,
+                    int top_k, uint64_t seed, Weights *w, const K3Cfg *c, K3Cache *cache,
+                    int nl, int *tmax, float **h, float **br, float *ks,
+                    float **sc, float *lg, int **seq, int *outtok, int maxb, size_t kper,
+                    K3Prefix *pf)
+{
+    char err[512]; int turn = 0;
+    int *prompt = *prompt_ref;
+    for (int i = 0; i < history->n; i++) if (history->v[i].role == K3_CHAT_ASSISTANT) turn++;
+    for (;;) {
+        const int need = np + gen + 1;
+        if (np > K3_MAX_PROMPT || need > K3_MAX_PROMPT + K3_MAX_GEN) {
+            fprintf(stderr, "chat: rendered transcript is %d tokens; current engine limit is %d prompt + %d generation tokens\n", np, K3_MAX_PROMPT, K3_MAX_GEN);
+            return 1;
+        }
+        if (incremental) {
+            const double kv_need = (double)need * K3_KV_BYTES_PER_POS;
+            const double avail = k3_mem_available_bytes();
+            if (avail > 0.0 && kv_need > avail * 0.9) {
+                char kb[32], ab[32];
+                human(kv_need, kb, sizeof kb); human(avail, ab, sizeof ab);
+                fprintf(stderr, "chat: KV cache for %d positions needs %s, but only %s is available; history was preserved\n", need, kb, ab);
+                return 1;
+            }
+        }
+        {
+            const int old_tmax = *tmax;
+            if (chat_resize(need, tmax, nl, maxb, kper, w, c, h, br, sc, seq) != 0) return 1;
+            /* The KV cache grew by copying its cached positions (chat_resize), so the
+             * record grows with it. If the record cannot be preserved it is dropped and
+             * this turn re-prefills; reuse is an optimisation, never a reason to fail. */
+            if (*tmax != old_tmax && incremental) (void)k3_prefix_grow(pf, *tmax, w->cached);
+        }
+        memcpy(*seq, prompt, (size_t)np * sizeof(**seq));
+        /* Reuse the previous turn's state only when this prompt begins with EXACTLY the
+         * ids that state was built from, and the engine agrees about how many that is.
+         * Anything else -- turn 1, /reset, an edited transcript, a failed forward last
+         * turn -- clears every carried buffer and prefills from position 0, which is what
+         * every turn did before. */
+        int base = incremental ? k3_prefix_reuse(pf, prompt, np) : 0;
+        if (base > 0 && base != w->cached) base = 0;
+        if (base == 0) {
+            memset(ks, 0, kper * (size_t)nl * sizeof(*ks));
+            if (incremental) {
+                const size_t kvper = (size_t)w->kv_cap * c->n_heads * (c->qk_nope + c->v_head);
+                const size_t rpper = (size_t)w->kv_cap * c->qk_rope;
+                memset(w->kvc, 0, kvper * (size_t)w->n_mla * sizeof(*w->kvc));
+                memset(w->ropec, 0, rpper * (size_t)w->n_mla * sizeof(*w->ropec));
+                k3_prefix_clear(pf);
+            }
+            w->cached = 0;
+        }
+        if (incremental)
+            printf("chat: %d of %d prompt positions already cached, prefilling %d\n",
+                   base, np, np - base);
+        int T = np, nraw = 0, frc = 0;
+        K3Sampler sampler; k3_sampler_init(&sampler, temperature, top_p, top_k, seed, (uint64_t)(turn + 1));
+        const double t_turn0 = now_s();
+        while (nraw < gen) {
+            if (incremental) {
+                /* Record ids WHERE THEY ARE FED (k3_prefix.h): the record, not the
+                 * REPL's arithmetic, is what the next turn's reuse decision consults. */
+                if (!nraw) {
+                    frc = forward(w, c, cache, *seq + base, T - base, lg, *sc, *h, *br, ks, NULL);
+                    if (!frc) { w->cached = T; k3_prefix_record(pf, *seq + base, base, T - base); }
+                } else {
+                    frc = forward(w, c, cache, *seq + T - 1, 1, lg, *sc, *h, *br, ks, NULL);
+                    if (!frc) { w->cached++; k3_prefix_record(pf, *seq + T - 1, T - 1, 1); }
+                }
+                if (frc) k3_prefix_clear(pf);   /* the state absorbed part of a failed step */
+            } else {
+                frc = forward(w, c, cache, *seq, T, lg, *sc, *h, *br, ks, NULL);
+            }
+            if (frc) break;
+            int next = 0;
+            if (k3_sampler_next(&sampler, lg, c->vocab, greedy, &next) != 0) {
+                fprintf(stderr, "chat: sampler failed\n"); frc = -1; break;
+            }
+            (*seq)[T++] = next; outtok[nraw++] = next;
+            /* One line per token on stderr, unbuffered. At the speeds a streamed trunk
+             * runs at (a minute or two per token), a REPL that prints nothing until the
+             * turn is complete is indistinguishable from a hung one, and a turn cut off
+             * by --gen or a timeout would otherwise leave no record of how far it got. */
+            fprintf(stderr, "chat: token %d/%d id %d (%.0f s)\n", nraw, gen, next, now_s() - t_turn0);
+            if (next == tmpl->eom_id || next == tmpl->eos_id) {
+                printf("chat: turn ended by %s (%d)\n", next == tmpl->eom_id ? "<|end_of_msg|>" : "[EOS]", next);
+                break;
+            }
+        }
+        k3_sampler_free(&sampler);
+        if (frc || (nraw == gen && outtok[nraw - 1] != tmpl->eom_id && outtok[nraw - 1] != tmpl->eos_id)) {
+            fprintf(stderr, "chat: assistant did not complete an official turn within --gen %d; transcript is preserved\n", gen);
+            return 1;
+        }
+        K3ChatMessage assistant;
+        if (k3_chat_parse_assistant_opts(tok, tmpl, opts, outtok, nraw, &assistant, err, sizeof err) != 0) {
+            fprintf(stderr, "chat: malformed assistant turn: %s\n", err); return 1;
+        }
+        if (assistant.reasoning_content) printf("<think>%s</think>\n", assistant.reasoning_content);
+        printf("<response>%s</response>\n", assistant.content);
+        if (k3_chat_history_add(history, K3_CHAT_ASSISTANT, assistant.content,
+                                assistant.reasoning_content, err, sizeof err) != 0) {
+            fprintf(stderr, "chat: %s\n", err); k3_chat_message_free(&assistant); return 1;
+        }
+        k3_chat_message_free(&assistant); turn++;
+        if (history_path && k3_chat_history_save(history, history_path, err, sizeof err) != 0) {
+            fprintf(stderr, "chat: %s\n", err); return 1;
+        }
+
+        for (;;) {
+            char *line = NULL;
+            if (!chat_read_line(&line)) return 0;
+            if (!strcmp(line, "/exit")) { free(line); return 0; }
+            if (!strcmp(line, "/help")) { printf("/help  show commands\n/reset clear this conversation\n/exit  leave chat\n"); free(line); continue; }
+            if (!strcmp(line, "/reset")) {
+                if (k3_chat_history_reset(history, err, sizeof err) != 0) {
+                    fprintf(stderr, "chat: %s\n", err); free(line); return 1;
+                }
+                if (history_path && k3_chat_history_save(history, history_path, err, sizeof err)) { fprintf(stderr, "chat: %s\n", err); return 1; }
+                printf("chat reset\n"); free(line); continue;
+            }
+            if (!*line) { free(line); continue; }
+            if (k3_chat_history_add(history, K3_CHAT_USER, line, NULL, err, sizeof err)) { fprintf(stderr, "chat: %s\n", err); free(line); return 1; }
+            free(line);
+            int *new_prompt = NULL, new_np = 0;
+            if (chat_render_ids(tok, history, opts, &new_prompt, &new_np, err, sizeof err) != 0 || new_np > K3_MAX_PROMPT) {
+                if (new_prompt) free(new_prompt);
+                k3_chat_message_free(&history->v[--history->n]);
+                fprintf(stderr, "chat: %s\n", new_np > K3_MAX_PROMPT ? "context limit reached; history was not changed" : err);
+                continue;
+            }
+            if (history_path && k3_chat_history_save(history, history_path, err, sizeof err)) { free(new_prompt); fprintf(stderr, "chat: %s\n", err); return 1; }
+            free(prompt); prompt = new_prompt; *prompt_ref = prompt; np = new_np; break;
+        }
+    }
+}
+
+/* Strict argv integers. atoi("1junk") is 1 and a value past INT_MAX is
+ * undefined behaviour, so a typo would silently run with a different number
+ * than the one typed. The whole string must be an integer in int range;
+ * value semantics (like the --layers -1 sentinel) stay with the caller. */
+static int parse_int_strict(const char *s, int *out)
+{
+    char *end = NULL;
+    long v;
+    if (!s || !*s) return -1;
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (errno == ERANGE || end == s || *end != '\0' || v < INT_MIN || v > INT_MAX) return -1;
+    *out = (int)v;
+    return 0;
+}
+
+
+int main(int argc, char **argv)
+{
+    /* Informational flags are answered before anything else, because they must work
+     * without a model directory, `k3 --help` on a machine with no checkpoint is the
+     * first thing most people type. */
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
+        if (!strcmp(argv[i], "--version")) { printf("k3 %s\n", K3_VERSION); return 0; }
+        if (!strcmp(argv[i], "--list-presets")) { k3_preset_list(stdout); return 0; }
+    }
+    if (argc < 2) { usage(stderr); return 2; }
+
+    const char *dir = argv[1];
+    if (dir[0] == '-') {
+        fprintf(stderr, "the first argument must be the model directory, got '%s'\n\n", dir);
+        usage(stderr);
+        return 2;
+    }
+    const char *ids_s = NULL, *outp = "k3_run.json", *trunk_dir = NULL;
+    /* A run whose --out cannot be written used to exit 0 regardless, indistinguishable
+     * from a run that wrote its result. Latch the failure and report it once the rest
+     * of the run has already printed everything it can to stdout. */
+    int out_fail = 0;
+    /* Expert-cache diagnostics are opt-in. They are only meaningful for cache research,
+     * and writing them unconditionally drops two undeclared files into whatever
+     * directory the user happened to run from. */
+    const char *trace_dir = NULL;
+    const char *logits_path = NULL;
+    const char *prompt_text = NULL, *prompt_file = NULL, *tok_dir = NULL;
+    const char *system_text = NULL, *history_path = NULL;
+    const char *cfg_path = NULL;
+    int gen = 8, want_layers = -1, gen_set = 0;
+    /* --stop-id, repeatable. Generation halts AFTER emitting a listed id, so the state
+     * written by --save-state still contains it and a later --load-state continues the
+     * sequence the model actually produced. Without this the engine always runs to
+     * --gen, which for a chat-tuned checkpoint means paying seconds per token for text
+     * past the end-of-message marker that a caller will only throw away. */
+    int stop_id[8]; int n_stop = 0, hit_stop = 0, stopped_at = -1;
+    double cache_gb = 64.0, trunk_gb = 16.0;
+    int budget_auto = 0;
+    int spec_n = 0;
+    int tf_check = 0;
+    const char *draft_dir = NULL;
+    double draft_gb = 6.0;
+    const char *load_state = NULL, *save_state = NULL;
+    const char *preset_name = NULL;
+    int incremental = 0, ultra = 0, chat = 0, greedy = 0;
+    int trunk_ring = 0;   /* 0 selects k3_trunk_open's default of 2 */
+    int threads = 0;      /* 0 = choose a default; see thread selection below */
+    K3ChatOptions chat_opts = k3_chat_options_default();
+    int no_think = 0, effort_set = 0;
+    int temperature_set = 0, top_p_set = 0, seed_set = 0, out_set = 0;
+    int top_k = 0, top_k_set = 0;
+    double temperature = 1.0, top_p = 0.95;
+    uint64_t seed = 0;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
+        else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
+        else if (!strcmp(argv[i], "--prompt-file") && i + 1 < argc) prompt_file = argv[++i];
+        else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
+        else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
+        else if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); gen_set = 1; }
+        else if (!strcmp(argv[i], "--stop-id") && i + 1 < argc) {
+            if (n_stop >= (int)(sizeof stop_id / sizeof stop_id[0])) {
+                fprintf(stderr, "--stop-id given more than %d times\n",
+                        (int)(sizeof stop_id / sizeof stop_id[0]));
+                return 2;
+            }
+            /* strtol, not atoi: atoi("abc") is 0, which is a real token id, so a typo
+             * would silently arm a stop on a token the model may well emit. Refuse
+             * anything that is not entirely a non-negative integer; the range check
+             * against the vocabulary has to wait until config.json has been read. */
+            {
+                char *end;
+                const long v = strtol(argv[++i], &end, 10);
+                if (*argv[i] == '\0' || *end != '\0' || v < 0) {
+                    fprintf(stderr, "--stop-id %s: expected a non-negative token id\n",
+                            argv[i]);
+                    return 2;
+                }
+                stop_id[n_stop++] = (int)v;
+            }
+        }
+        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--layers") && i + 1 < argc) {
+            /* Syntax here, range later: the range check needs the layer count
+             * from config.json, but "1junk" must not survive until then as a
+             * silent 1. "-1" still parses, so the not-given sentinel keeps
+             * working. */
+            if (parse_int_strict(argv[i + 1], &want_layers) != 0) {
+                fprintf(stderr, "--layers %s is not an integer\n", argv[i + 1]);
+                return 2;
+            }
+            i++;
+        }
+        else if (!strcmp(argv[i], "--out") && i + 1 < argc) { outp = argv[++i]; out_set = 1; }
+        else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
+        else if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec_n = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--tf-check")) tf_check = 1;
+        else if (!strcmp(argv[i], "--load-state") && i + 1 < argc) load_state = argv[++i];
+        else if (!strcmp(argv[i], "--save-state") && i + 1 < argc) save_state = argv[++i];
+        else if (!strcmp(argv[i], "--draft-trunk") && i + 1 < argc) draft_dir = argv[++i];
+        else if (!strcmp(argv[i], "--draft-trunk-gb") && i + 1 < argc) draft_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--trunk-gb") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "auto")) budget_auto = 1;
+            else { trunk_gb = atof(v); budget_auto = 0; }
+        }
+        else if (!strcmp(argv[i], "--trunk-ring") && i + 1 < argc) trunk_ring = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
+            /* Strict for the same reason as --layers: atoi("8x") is 8 and a typo
+             * should not silently pick a different thread count than the one typed. */
+            if (parse_int_strict(argv[i + 1], &threads) != 0 || threads < 1) {
+                fprintf(stderr, "--threads %s: expected an integer of 1 or more\n", argv[i + 1]);
+                return 2;
+            }
+            i++;
+        }
+        else if (!strcmp(argv[i], "--incremental")) incremental = 1;
+        else if (!strcmp(argv[i], "--ultra-low-memory")) ultra = 1;
+        else if (!strcmp(argv[i], "--chat")) chat = 1;
+        else if (!strcmp(argv[i], "--system") && i + 1 < argc) system_text = argv[++i];
+        else if (!strcmp(argv[i], "--history") && i + 1 < argc) history_path = argv[++i];
+        else if (!strcmp(argv[i], "--temperature") && i + 1 < argc) { temperature = atof(argv[++i]); temperature_set = 1; }
+        else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) { top_p = atof(argv[++i]); top_p_set = 1; }
+        else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
+            const char *value = argv[++i];
+            char *end = NULL;
+            errno = 0; seed = strtoull(value, &end, 10);
+            if (value[0] == '-' || errno || !end || *end) { fprintf(stderr, "--seed needs an unsigned integer\n"); return 2; }
+            seed_set = 1;
+        }
+        else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) {
+            /* A full integer of 1 or more. 0 would mean disabled, which is
+             * already the default, so an explicit 0 is a typo; anything past
+             * the vocabulary simply stays eligible, like disabled. */
+            char *end = NULL;
+            errno = 0;
+            const long v = strtol(argv[++i], &end, 10);
+            if (errno == ERANGE || end == argv[i] || *end != '\0' || v < 1 || v > INT_MAX) {
+                fprintf(stderr, "--top-k %s: expected an integer of 1 or more\n", argv[i]);
+                return 2;
+            }
+            top_k = (int)v; top_k_set = 1;
+        }
+        else if (!strcmp(argv[i], "--greedy")) greedy = 1;
+        else if (!strcmp(argv[i], "--no-think")) { chat_opts.thinking = 0; no_think = 1; }
+        else if (!strcmp(argv[i], "--thinking-effort") && i + 1 < argc) { chat_opts.thinking_effort = argv[++i]; effort_set = 1; }
+        else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
+        else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
+        else if (!strcmp(argv[i], "--preset") && i + 1 < argc && !strcmp(argv[i + 1], "auto")) {
+            /* Not in the table: the table is fixed budgets, auto is computed from this
+             * machine's MemAvailable at startup, below, once parsing is complete. */
+            i++;
+            budget_auto = 1;
+            preset_name = "auto";
+            ultra = 0;
+        }
+        else if (!strcmp(argv[i], "--preset") && i + 1 < argc) {
+            const K3Preset *p = k3_preset_find(argv[++i]);
+            if (!p) {
+                fprintf(stderr, "unknown preset '%s'\n\n", argv[i]);
+                k3_preset_list(stderr);
+                return 2;
+            }
+            /* A preset sets the budget; an explicit --trunk-gb/--cache-gb after it still
+             * wins, because the flags are applied in argv order. */
+            trunk_gb = p->trunk_gb;
+            cache_gb = p->cache_gb;
+            preset_name = p->name;
+            ultra = p->ultra;
+        }
+        else if (!strcmp(argv[i], "--list-presets")) { k3_preset_list(stdout); return 0; }
+        else if (!strcmp(argv[i], "--version")) {
+            printf("k3 %s\n", K3_VERSION);
+            return 0;
+        }
+        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
+        else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
+    }
+
+#ifdef _OPENMP
+    /* Thread selection, in precedence order: --threads, then OMP_NUM_THREADS, then the
+     * physical core count. Only the last is a change from OpenMP's own default, which is
+     * one thread per logical cpu. An explicit OMP_NUM_THREADS is left alone so existing
+     * scripts and the docs that mention it keep working. */
+    if (threads > 0) {
+        omp_set_num_threads(threads);
+    } else if (!getenv("OMP_NUM_THREADS")) {
+        const int cores = k3_physical_cores();
+        if (cores > 0 && cores < omp_get_max_threads()) omp_set_num_threads(cores);
+    }
+    printf("threads: %d\n", omp_get_max_threads());
+#else
+    if (threads > 0)
+        fprintf(stderr, "--threads ignored: built without OpenMP\n");
+#endif
+
+    if (ultra && !trunk_dir) {
+        fprintf(stderr, "--ultra-low-memory needs --trunk; resident trunk cannot fit its "
+                        "memory contract\n");
+        return 2;
+    }
+    if (ultra && budget_auto) {
+        fprintf(stderr, "--ultra-low-memory uses explicit bounded budgets; use "
+                        "--preset ultra or pass --trunk-gb/--cache-gb\n");
+        return 2;
+    }
+    if (ultra && (spec_n > 0 || draft_dir)) {
+        fprintf(stderr,
+                "--ultra-low-memory does not yet support --spec or --draft-trunk; "
+                "use deterministic serial decode\n");
+        return 2;
+    }
+    if (chat && !gen_set) gen = K3_MAX_GEN;
+    if ((no_think || effort_set) && !chat) {
+        fprintf(stderr, "%s only applies to --chat\n", no_think ? "--no-think" : "--thinking-effort");
+        return 2;
+    }
+    if (no_think && effort_set) {
+        /* The encoder silently ignores thinking_effort once thinking is off. A CLI that did
+         * the same would run a very long prompt under a setting the user never got. */
+        fprintf(stderr, "--no-think and --thinking-effort contradict each other; pass one of them\n");
+        return 2;
+    }
+    if (chat) {
+        char oerr[256];
+        if (k3_chat_options_validate(&chat_opts, oerr, sizeof oerr) != 0) { fprintf(stderr, "--thinking-effort: %s\n", oerr); return 2; }
+    }
+    {
+        int nsrc = (ids_s != NULL) + (prompt_text != NULL) + (prompt_file != NULL);
+        if (chat && nsrc) {
+            fprintf(stderr, "--chat supplies its prompt through the REPL/history; do not also pass --ids, --prompt, or --prompt-file\n");
+            return 2;
+        }
+        if (!chat && nsrc == 0) {
+            fprintf(stderr, "one of --ids, --prompt or --prompt-file is required\n");
+            return 2;
+        }
+        if (nsrc > 1) {
+            /* Refuse rather than pick: silently preferring one source would make a
+             * mistyped invocation run the WRONG prompt for tens of minutes. */
+            fprintf(stderr, "--ids, --prompt and --prompt-file are mutually exclusive\n");
+            return 2;
+        }
+    }
+    if (chat) {
+        if (!tok_dir) {
+            fprintf(stderr, "--chat needs --tok DIR with the official Kimi K3 tokenizer files\n");
+            return 2;
+        }
+        if (load_state || save_state || draft_dir || spec_n || tf_check || logits_path || trace_dir || out_set) {
+            fprintf(stderr, "--chat cannot be combined with state files, speculative/draft modes, diagnostics, or --out\n");
+            return 2;
+        }
+        if (!(temperature > 0.0) || !isfinite(temperature) || !(top_p > 0.0) || top_p > 1.0 || !isfinite(top_p)) {
+            fprintf(stderr, "--temperature must be finite and > 0; --top-p must be in (0, 1]\n");
+            return 2;
+        }
+        if (gen <= 0) {
+            fprintf(stderr, "--chat needs --gen greater than zero to complete an assistant turn\n");
+            return 2;
+        }
+    } else if (system_text || history_path || temperature_set || top_p_set || top_k_set || seed_set || greedy) {
+        fprintf(stderr, "--system, --history, --temperature, --top-p, --top-k, --seed, and --greedy require --chat\n");
+        return 2;
+    }
+    /* Greedy unless a sampling flag was given. Greedy decoding is what makes output
+     * identical across memory budgets, which the test suite depends on, so sampling
+     * is opt-in here exactly as docs/ROADMAP.md says it must be; a chat REPL that
+     * silently sampled would be the one path in the engine whose output could not
+     * be reproduced. --greedy stays as an explicit override for scripts that set a
+     * temperature and then want it ignored. */
+    if (!(temperature_set || top_p_set || top_k_set || seed_set)) greedy = 1;
+    if (chat && !seed_set) {
+        /* A supplied seed is reproducible across restarts.  Without one, start a fresh
+         * stochastic session; the generated value is printed in the banner. */
+        seed = (uint64_t)time(NULL) ^ ((uint64_t)(uintptr_t)&seed << 16);
+    }
+
+    /* ---- auto budget ----
+     * RAM-first: per token the engine re-reads the ENTIRE streamed trunk but only
+     * ~25.8 GB of experts, and steady-state expert caching yields nothing until the
+     * arena is tens of GB. Measured: a gigabyte pinned in the trunk is worth roughly
+     * 70x a gigabyte of expert cache at the margin. So auto gives the trunk everything
+     * this machine has, minus a safety margin, and the cache gets real memory only
+     * after the whole 110 GB trunk would be resident. */
+    if (budget_auto) {
+        const double avail = k3_mem_available_bytes();
+        if (avail <= 0.0) {
+            fprintf(stderr, "--preset auto could not read this machine's available memory; "
+                            "pass explicit --trunk-gb/--cache-gb\n");
+            return 2;
+        }
+        /* Fixed costs outside both budgets: embeddings + lm_head 4.70 GB, safetensors
+         * index, recurrent state 0.63 GB, KV cache and scratch. Reserve them, plus the
+         * same headroom the admission check enforces, plus 2 GB for buffers and the KV
+         * cache, which are not known until the config is loaded further down. */
+        const double reserve = 2.0 + (1.0 - K3_MEM_ADMIT) * (avail / 1e9) + 4.70 + 1.70;
+        double usable = avail / 1e9 - reserve;
+        const double slot_min = 2.5;   /* one ring slot + headroom; refuse below */
+        const double cache_min = 0.5;  /* topk+1 expert slots is ~0.3 GB */
+        if (usable < slot_min + cache_min) {
+            fprintf(stderr, "auto: only %.1f GB usable after the %.1f GB reserve; "
+                            "below the %.1f GB floor. Pass explicit budgets.\n",
+                    usable, reserve, slot_min + cache_min);
+            return 2;
+        }
+        const double trunk_full = 111.0;   /* full packed trunk + widen headroom */
+        if (usable - cache_min >= trunk_full) {
+            /* Full residency: per-token trunk reads disappear entirely. This is the
+             * configuration auto exists for. */
+            trunk_gb = trunk_full;
+            cache_gb = usable - trunk_full;
+        } else {
+            /* Partial pinning has WEAK returns and real hazards, both measured on the
+             * released checkpoint: pinning 51 of 109 GB ran 14% SLOWER than pinning
+             * nothing (48.2 vs 42.1 s/token) because peak RSS at ~90% of RAM put the
+             * kernel into reclaim and the device served the remaining tail of the
+             * packed trunk a third slower, while a moderate pin stayed neutral to
+             * mildly positive (40.1 s/token at 25 GB, device throughput unharmed).
+             * So below full residency, auto pins only while the whole process stays
+             * comfortably clear of the RAM ceiling. */
+            const double memtotal = k3_mem_total_bytes();
+            const double rss_ceiling = memtotal > 0.0 ? 0.55 * memtotal / 1e9
+                                                      : usable;   /* total unknown: keep old cap */
+            double cap = rss_ceiling - reserve - cache_min;
+            if (cap < slot_min) cap = slot_min;
+            trunk_gb = usable - cache_min;
+            if (trunk_gb > cap) trunk_gb = cap;
+            cache_gb = cache_min;
+        }
+        printf("auto budget: %.1f GB available, %.1f GB reserved -> trunk %.1f GB / "
+               "expert cache %.1f GB\n", avail / 1e9, reserve, trunk_gb, cache_gb);
+    }
+
+    /* fa is sized for the released 24 MLA layers with generous headroom; k3_cfg_load
+     * refuses a config that would overrun it rather than truncating the layer map. */
+    K3Cfg c; static int fa[128];
+    if (!real_cfg(&c, fa, 128, dir, cfg_path)) {
+        fprintf(stderr, "ABORTED: the model config could not be read with confidence.\n");
+        return 2;
+    }
+    /* --layers 0, or anything past the real layer count, used to fall through this
+     * check silently and run the full model, as if --layers had never been given. A
+     * partial stack is a deliberate test instrument; an out-of-range request is a
+     * typo, and a typo here should not look like a successful full-model run. */
+    if (want_layers != -1 && (want_layers < 1 || want_layers > c.n_layers)) {
+        fprintf(stderr, "--layers %d is out of range: want 1..%d\n",
+                want_layers, c.n_layers);
+        return 2;
+    }
+    if (want_layers > 0 && want_layers < c.n_layers) {
+        printf("NOTE: binding only the first %d of %d layers. Output is NOT the full "
+               "model; it is a partial stack for testing the machinery.\n\n",
+               want_layers, c.n_layers);
+    }
+
+    /* ---- prompt ----
+     * Batch keeps its historical three input channels.  Chat has one more explicit
+     * representation: transcript records are rendered with the official XTML segment
+     * encoder, never by treating a generic template string as a prompt. */
+    int *prompt = NULL;
+    int np = 0;
+    Tok tok; int have_tok = 0;
+    K3ChatHistory chat_history;
+    K3ChatTemplate chat_template;
+    k3_chat_history_init(&chat_history);
+
+    if (chat) {
+        char err[512];
+        k3_tok_load(&tok, tok_dir);
+        have_tok = 1;
+        if (k3_chat_template_init(&tok, &chat_template, err, sizeof err) != 0) {
+            fprintf(stderr, "chat: %s\n", err); return 2;
+        }
+        if (history_path && k3_chat_history_load(&chat_history, history_path, err, sizeof err) != 0) {
+            fprintf(stderr, "chat: %s\n", err); return 2;
+        }
+        if (system_text) {
+            if (chat_history.n) {
+                if (chat_history.v[0].role != K3_CHAT_SYSTEM || strcmp(chat_history.v[0].content, system_text)) {
+                    fprintf(stderr, "chat: --system does not match the initial system record in %s\n", history_path ? history_path : "history");
+                    return 2;
+                }
+            } else if (k3_chat_history_add(&chat_history, K3_CHAT_SYSTEM, system_text, NULL, err, sizeof err) != 0) {
+                fprintf(stderr, "chat: %s\n", err); return 2;
+            }
+        }
+        /* Persist a supplied system record immediately. It is part of the portable
+         * conversation contract even if the user exits before asking a first question. */
+        if (history_path && k3_chat_history_save(&chat_history, history_path, err, sizeof err) != 0) {
+            fprintf(stderr, "chat: %s\n", err); return 2;
+        }
+
+        /* A transcript ending in a user turn can be resumed after an interrupted run.
+         * Otherwise read exactly one fresh user turn before the expensive model setup,
+         * so the buffers and KV plan are sized from the real rendered prompt. */
+        while (!chat_history.n || chat_history.v[chat_history.n - 1].role != K3_CHAT_USER) {
+            char *line = NULL;
+            if (!chat_read_line(&line)) { k3_chat_history_free(&chat_history); return 0; }
+            if (!strcmp(line, "/exit")) { free(line); k3_chat_history_free(&chat_history); return 0; }
+            if (!strcmp(line, "/help")) {
+                printf("/help  show commands\n/reset clear this conversation\n/exit  leave chat\n");
+                free(line); continue;
+            }
+            if (!strcmp(line, "/reset")) {
+                if (k3_chat_history_reset(&chat_history, err, sizeof err) != 0) {
+                    fprintf(stderr, "chat: %s\n", err); free(line); return 2;
+                }
+                if (history_path && k3_chat_history_save(&chat_history, history_path, err, sizeof err) != 0) {
+                    fprintf(stderr, "chat: %s\n", err); return 2;
+                }
+                printf("chat reset\n"); free(line); continue;
+            }
+            if (!*line) { free(line); continue; }
+            if (k3_chat_history_add(&chat_history, K3_CHAT_USER, line, NULL, err, sizeof err) != 0) {
+                fprintf(stderr, "chat: %s\n", err); free(line); return 2;
+            }
+            free(line);
+            break;
+        }
+        if (chat_render_ids(&tok, &chat_history, &chat_opts, &prompt, &np, err, sizeof err) != 0) {
+            fprintf(stderr, "chat: %s\n", err); return 2;
+        }
+        if (history_path && k3_chat_history_save(&chat_history, history_path, err, sizeof err) != 0) {
+            fprintf(stderr, "chat: %s\n", err); return 2;
+        }
+        printf("  XTML prompt: %d ids, generation limit %d, %s, %s%s\n", np, gen,
+               greedy ? "greedy" : "temperature/top-p sampling",
+               chat_opts.thinking ? "thinking_effort=" : "thinking off",
+               chat_opts.thinking ? chat_opts.thinking_effort : "");
+        if (!greedy) {
+            if (top_k_set) printf("  sampler  : PCG32 seed %llu, temperature %.3f, top-p %.3f, top-k %d\n",
+                                  (unsigned long long)seed, temperature, top_p, top_k);
+            else printf("  sampler  : PCG32 seed %llu, temperature %.3f, top-p %.3f\n",
+                        (unsigned long long)seed, temperature, top_p);
+        }
+    } else {
+        /* Heap, not stack. This was `int prompt[4096]` and it was the reason the engine
+         * refused prompts longer than 4096 ids -- a stack-array size, not a model or
+         * memory limit. */
+        prompt = (int *)malloc((size_t)K3_MAX_PROMPT * sizeof(int));
+        if (!prompt) { fprintf(stderr, "OOM allocating prompt buffer\n"); return 2; }
+        if (prompt_text || prompt_file) {
+            if (!tok_dir) {
+                fprintf(stderr, "--prompt/--prompt-file need --tok DIR (the directory with "
+                                "tiktoken.model and tokenizer_config.json)\n");
+                return 2;
+            }
+            k3_tok_load(&tok, tok_dir);
+            have_tok = 1;
+
+            char *ptext = NULL; long plen = 0;
+            if (prompt_file) {
+                ptext = tk_read_file(prompt_file, &plen);   /* exits if unreadable */
+            } else {
+                plen  = (long)strlen(prompt_text);
+                ptext = (char *)malloc((size_t)plen + 1);
+                if (!ptext) { fprintf(stderr, "OOM on prompt\n"); return 2; }
+                memcpy(ptext, prompt_text, (size_t)plen + 1);
+            }
+            np = tok_encode(&tok, ptext, (int)plen, prompt, K3_MAX_PROMPT);
+            free(ptext);
+            printf("  tokenized: %ld bytes -> %d ids\n", plen, np);
+        } else {
+            for (const char *p = ids_s; *p && np < K3_MAX_PROMPT; ) {
+                /* strtol with no endptr check spins on garbage: "abc" never advances
+                 * p, so the loop makes no progress and, because id 0 is exactly what
+                 * a failed strtol call returns, silently fills the prompt with zeros
+                 * instead of refusing it. Require each piece to parse as a whole
+                 * integer ending at a separator or the string's end. Values must
+                 * also fit an int: 4294967296 wraps to 0 on LP64, which is a real
+                 * token id, so the vocabulary check below would wave it through. */
+                char *end = NULL;
+                errno = 0;
+                const long v = strtol(p, &end, 10);
+                if (errno == ERANGE || end == p || v < INT_MIN || v > INT_MAX ||
+                    (*end != ',' && *end != ' ' && *end != '\0')) {
+                    fprintf(stderr, "bad --ids: '%s' is not a comma separated list of "
+                                    "integers\n", ids_s);
+                    return 2;
+                }
+                prompt[np++] = (int)v;
+                p = end;
+                while (*p == ',' || *p == ' ') p++;
+            }
+        }
+    }
+    if (np == 0) { fprintf(stderr, "no prompt ids parsed\n"); return 2; }
+    for (int i = 0; i < np; i++)
+        if (prompt[i] < 0 || prompt[i] >= c.vocab) {
+            fprintf(stderr, "token id %d is outside the vocabulary of %d\n", prompt[i], c.vocab);
+            return 2;
+        }
+
+    /* Validate the request before allocating anything.
+     *
+     * Refuse rather than clamp: a caller who asks for more tokens than this build
+     * supports should be told, not quietly handed fewer. The decode loop's own guard
+     * (T >= Tmax) is a backstop, not a bounds check. */
+    if (gen < 0 || gen > K3_MAX_GEN) {
+        fprintf(stderr, "--gen %d is out of range: this build generates at most %d "
+                        "tokens (outtok[%d])\n", gen, K3_MAX_GEN, K3_MAX_GEN);
+        return 2;
+    }
+    /* A stop id the model can never emit gives a run that never stops, which is
+     * indistinguishable from a model that simply did not produce one, and the two
+     * need different fixes. Refuse it here, where the vocabulary is finally known. */
+    for (int s = 0; s < n_stop; s++)
+        if (stop_id[s] >= c.vocab) {
+            fprintf(stderr, "--stop-id %d is outside the vocabulary of %d\n",
+                    stop_id[s], c.vocab);
+            return 2;
+        }
+    if (np > K3_MAX_PROMPT) {
+        fprintf(stderr, "prompt of %d ids exceeds the %d-id ceiling (seq[%d])\n",
+                np, K3_MAX_PROMPT, K3_MAX_PROMPT + K3_MAX_GEN);
+        return 2;
+    }
+    if (np + gen + 1 > K3_MAX_PROMPT + K3_MAX_GEN) {
+        fprintf(stderr, "prompt %d + gen %d + 1 exceeds the %d-position ceiling\n",
+                np, gen, K3_MAX_PROMPT + K3_MAX_GEN);
+        return 2;
+    }
+    /* THE REAL CONTEXT LIMIT is the MLA KV cache, not any array size. Check it against
+     * what the kernel says is actually available and refuse with both numbers, rather
+     * than letting a long prompt get 40 minutes into a run and then be OOM-killed. Only
+     * incremental decode allocates the KV cache; full recompute carries no cache. */
+    if (incremental) {
+        const double kv_need = (double)(np + gen + 1) * K3_KV_BYTES_PER_POS;
+        const double avail   = k3_mem_available_bytes();
+        char kb[32], ab[32];
+        human(kv_need, kb, sizeof kb);
+        human(avail, ab, sizeof ab);
+        printf("  KV cache : %s for %d positions (%.2f MB/position)\n",
+               kb, np + gen + 1, K3_KV_BYTES_PER_POS / 1e6);
+        if (avail > 0.0 && kv_need > avail * 0.9) {
+            fprintf(stderr,
+                "\nREFUSING: the KV cache for %d positions needs %s but only %s is\n"
+                "available. This is a MEMORY limit, not an engine ceiling: MLA caches\n"
+                "expanded k and v in fp32 across 24 layers, so context costs ~2.37 MB per\n"
+                "position regardless of budget. Shorten the request, or use full\n"
+                "recompute (drop --incremental), which carries no KV cache at all.\n",
+                np + gen + 1, kb, ab);
+            return 2;
+        }
+    }
+
+    char b1[32];
+    printf("Kimi K3, pure C, released checkpoint\n");
+    /* The directory, not a shard count: the index has not been built yet at this point.
+     * The count is printed by the "indexed N tensors from M shards" line below, once
+     * k3_st_open has actually counted them. */
+    printf("  model    : %s\n", dir);
+    printf("  prompt   : %d tokens, generating %d\n", np, gen);
+    /* Echo the preset so a captured log is self-describing: a timing figure is
+     * meaningless without the budget that produced it. */
+    if (preset_name)
+        printf("  preset   : %s (trunk %.2f GB / expert cache %.2f GB)\n",
+               preset_name, trunk_gb, cache_gb);
+    printf("\n");
+
+    K3St st;
+    double t0 = now_s();
+    if (k3_st_open(&st, dir) != 0) return 1;
+    printf("indexed %d tensors from %d shards in %.2f s\n", st.nt, st.nshard, now_s() - t0);
+
+    /* ---- how much will this take? Report BEFORE allocating, so a box that cannot
+     * hold it fails with a number rather than an OOM kill. ---- */
+    const int NL = (want_layers > 0 && want_layers < c.n_layers) ? want_layers : c.n_layers;
+    int64_t total = 0; int missing = 0;
+    for (int L = 0; L < NL; L++) {
+        const int64_t n = k3_bind_layer_bytes(&st, &c, L);
+        if (n < 0) { missing++; continue; }
+        total += n;
+    }
+    if (missing) {
+        fprintf(stderr, "\n%d of %d layers are missing tensors in this shard set. "
+                        "A partial download cannot run the model.\n", missing, NL);
+        return 1;
+    }
+    human((double)total, b1, sizeof b1);
+    /* Report the mode actually in effect. The trunk is either resident or streamed and
+     * the two have very different memory profiles, so the banner must reflect the real
+     * choice rather than a default. */
+    if (trunk_dir)
+        printf("trunk on disk : %s total (STREAMED from %s, not held in RAM)\n",
+               b1, trunk_dir);
+    else
+        printf("resident trunk: %s in RAM (large matrices kept in the checkpoint's bf16,\n"
+               "  fp32 only for the norms and biases that kernels read elementwise)\n", b1);
+
+    /* Add up EVERYTHING before allocating anything. Being OOM-killed halfway through
+     * binding wastes the whole load and reports nothing useful; a refusal with the two
+     * numbers side by side says exactly what box this needs. */
+    {
+        const int64_t E64 = c.hidden;
+        const double w_trunk = trunk_dir ? trunk_gb * 1e9 : (double)total;
+        const double w_model = ultra
+            ? (double)K3_MODEL_STREAM_CHUNK + 2.0 * K3_ST_ALIGN + 3.0 * E64 * 4
+            : 2.0 * (double)c.vocab * E64 * 2 + 3.0 * E64 * 4;
+        const double w_cache = cache_gb * 1e9;
+        const int Tm = np + gen + 1;
+        const int mb = c.n_layers / c.attn_res_block + 2;
+        const int Pp = c.kda_heads * c.kda_head_dim;
+        const int state_layers = (ultra && !incremental) ? 1 : NL;
+        const double w_state = (double)((size_t)Pp * c.kda_head_dim
+                              + (size_t)3 * Pp * (c.conv_k - 1)) * state_layers * 4;
+        const double w_buf = ((double)Tm * E64 + (double)Tm * mb * E64
+                              + (double)k3_layer_scratch(&c, Tm) + (double)c.vocab) * 4;
+        /* The KV cache MUST be in this total: it is the only term that grows with
+         * context, so a guard that omits it is blind to the one thing it exists to
+         * catch. k3_mla_cached stores expanded per-head k and v plus the shared rope
+         * slot, in fp32, across all 24 MLA layers -- 2.37 MB per position, so a
+         * 4096-token prompt alone is 9.7 GB. */
+        int n_mla = 0;
+        for (int L = 0; L < c.n_layers; L++) if (k3_is_mla(&c, L)) n_mla++;
+        const double w_kv = incremental
+            ? (double)Tm * n_mla
+              * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 4
+            : 0.0;
+        const double need_b = w_trunk + w_model + w_cache + w_state + w_buf + w_kv;
+        const double have = k3_mem_available_bytes();
+
+        char b2[32], b3[32], b4[32], b5[32], b6[32], b7[32];
+        human(w_kv, b7, sizeof b7);
+        human(w_trunk, b1, sizeof b1); human(w_model, b2, sizeof b2);
+        human(w_cache, b3, sizeof b3); human(w_state, b4, sizeof b4);
+        human(w_buf, b5, sizeof b5);   human(need_b, b6, sizeof b6);
+        printf("\nmemory plan\n");
+        printf("  trunk %-10s %s\n  embed + lm_head  %s %s\n  expert cache     %s\n"
+               "  recurrent state  %s\n  buffers          %s\n  KV cache         %s\n"
+               "  TOTAL            %s\n",
+               trunk_dir ? "(STREAMED)" : "(resident)", b1, b2,
+               ultra ? "(STREAMED)" : "(resident)", b3, b4, b5, b7, b6);
+        if (have > 0.0) {
+            human(have, b1, sizeof b1);
+            printf("  available        %s\n", b1);
+            if (need_b > have * K3_MEM_ADMIT) {
+                /* Against the ceiling actually enforced, not against `have`: the check
+                 * fires between the ceiling and 100%, where need_b - have is negative
+                 * and the message read "a shortfall of -5.59 GB". */
+                char b8[32];
+                human(need_b - have * K3_MEM_ADMIT, b2, sizeof b2);
+                human(have * K3_MEM_ADMIT, b8, sizeof b8);
+                fprintf(stderr,
+                        "\nREFUSING TO START: this needs %s. The machine has %s available "
+                        "and a plan may use at most %s of that, so this is %s over the "
+                        "limit.\n"
+                        "Options: a larger box, a smaller --cache-gb, or fewer --layers.\n",
+                        b6, b1, b8, b2);
+                return 1;
+            }
+        }
+        printf("\n");
+    }
+
+    Weights w; memset(&w, 0, sizeof w);
+    w.lay = (K3LayerBind *)calloc((size_t)NL, sizeof(K3LayerBind));
+    if (!w.lay) return 1;
+
+    static K3Trunk trunk;
+    t0 = now_s();
+    if (trunk_dir) {
+        /* STREAMED. Nothing is bound up front: each layer is read from the packed trunk
+         * on fast local storage as the forward pass reaches it. RAM stops being a floor
+         * and becomes a dial, and unlike quantisation it costs no accuracy, which
+         * matters because the K3 report (4.1.4) keeps exactly these tensors in higher
+         * precision on purpose. */
+        if (k3_trunk_open(&trunk, trunk_dir, &c, (int64_t)(trunk_gb * 1e9),
+                          trunk_ring) != 0) return 1;
+        if (trunk.n_layers < NL) {
+            fprintf(stderr, "packed trunk has %d layers, need %d\n", trunk.n_layers, NL);
+            return 1;
+        }
+        w.trunk = &trunk;
+        w.n_bound = NL;
+        printf("trunk streaming enabled from %s in %.1f s\n", trunk_dir, now_s() - t0);
+    } else {
+        for (int L = 0; L < NL; L++) {
+            if (k3_bind_layer(&st, &c, L, &w.lay[L]) != 0) {
+                fprintf(stderr, "bind failed at layer %d\n", L); return 1;
+            }
+            w.n_bound = L + 1;
+            if ((L + 1) % 10 == 0 || L + 1 == NL) {
+                printf("  bound %d/%d layers, %.1f s elapsed\n", L + 1, NL, now_s() - t0);
+                fflush(stdout);
+            }
+        }
+        const double t_bind = now_s() - t0;
+        printf("trunk loaded in %.1f s (%.0f MB/s from disk)\n",
+               t_bind, (double)total / 1e6 / t_bind);
+    }
+
+    t0 = now_s();
+    w.ultra = ultra;
+    if (k3_bind_model_parts(&st, &c, !ultra, !ultra, &w.mb) != 0) return 1;
+    if (ultra && k3_model_stream_init(&w.ms, &st, &c) != 0) return 1;
+    human((double)w.mb.nbytes, b1, sizeof b1);
+    if (ultra)
+        printf("final norms: %s resident; embedding and lm_head streamed in %.1f s\n\n",
+               b1, now_s() - t0);
+    else
+        printf("embedding, final norm and lm_head: %s in %.1f s\n\n", b1, now_s() - t0);
+
+    K3Cache cache;
+    if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0) return 1;
+    {   /* The plan is a forecast. This is the outcome. */
+        char rb[32];
+        human(peak_rss_bytes(), rb, sizeof rb);
+        printf("peak RSS after loading weights: %s  (the plan above is a forecast, "
+               "this is measured)\n", rb);
+    }
+    printf("expert cache: %d slots x %.2f MB = %.2f GB (%.2f%% of the 1.45 TB expert pool)\n\n",
+           cache.nslot, (double)cache.slot_bytes / 1e6,
+           (double)cache.nslot * cache.slot_bytes / 1e9,
+           100.0 * cache.nslot / (double)(92 * c.n_experts));
+
+    /* ---- buffers ----
+     * A resumed session must hold the saved history as well as the new tokens, so the
+     * KV cache and every per-position buffer are sized for both. The header is read
+     * here, before anything is allocated; the payload is restored after. */
+    K3StateHdr shd;
+    int prior = 0;
+    if (load_state) {
+        if (!incremental) {
+            fprintf(stderr, "--load-state needs --incremental\n");
+            return 2;
+        }
+        if (k3_state_peek(load_state, &shd) != 0) return 1;
+        prior = shd.nseq;
+        printf("resuming from %s: %d prior positions, %d new\n\n", load_state, prior, np);
+    }
+    int Tmax = prior + np + gen + 1;
+    const int E = c.hidden;
+    const int maxb = c.n_layers / c.attn_res_block + 2;
+    const int P = c.kda_heads * c.kda_head_dim;
+    const size_t kper = (size_t)P * c.kda_head_dim + (size_t)3 * P * (c.conv_k - 1);
+
+    /* The model-level aggregator lays out fold[E] followed by (nb+1) source rows of E
+     * inside scratch, and nb reaches n_layers/attn_res_block = 8 at full depth. So
+     * scratch must hold at least (maxb + 2) * hidden floats. k3_layer_scratch includes
+     * exactly that term, but an off-by-one here would overwrite whatever follows
+     * without any symptom until the logits came out subtly wrong, so it is checked
+     * rather than assumed. */
+    {
+        const size_t need_scratch = (size_t)(maxb + 2) * E;
+        const size_t have_scratch = k3_layer_scratch(&c, Tmax);
+        if (have_scratch < need_scratch) {
+            fprintf(stderr, "scratch is %zu floats, the attn-res aggregator needs %zu\n",
+                    have_scratch, need_scratch);
+            return 1;
+        }
+    }
+
+    float *h  = (float *)malloc((size_t)Tmax * E * sizeof(float));
+    float *br = (float *)malloc((size_t)Tmax * maxb * E * sizeof(float));
+    const int state_layers = (ultra && !incremental) ? 1 : NL;
+    float *ks = (float *)malloc(kper * (size_t)state_layers * sizeof(float));
+    size_t sc_need = k3_layer_scratch(&c, Tmax);
+    {   /* the cached MLA path sizes its score buffer by cache capacity, not by T */
+        const size_t ic = k3_mla_scratch_cached(&c, Tmax, Tmax, 1);
+        if (ic > sc_need) sc_need = ic;
+    }
+    float *sc = (float *)malloc(sc_need * sizeof(float));
+    float *lg = (float *)malloc((size_t)c.vocab * sizeof(float));
+    if (!h || !br || !ks || !sc || !lg) { fprintf(stderr, "buffer allocation failed\n"); return 1; }
+    human((double)(kper * state_layers) * 4, b1, sizeof b1);
+    if (state_layers == 1 && NL > 1)
+        printf("recurrent state: one %s slot, cleared and reused across %d layers\n\n",
+               b1, NL);
+    else
+        printf("recurrent state for %d layers: %s\n\n", state_layers, b1);
+
+    /* ---- generate ----
+     * Heap and sized from the ACTUAL request, not from the ceiling. These were
+     * `int seq[K3_MAX_PROMPT + K3_MAX_GEN]` and `int outtok[K3_MAX_GEN]` on the stack,
+     * which is why the ceiling had to stay small enough to be a stack array. */
+    int *seq = (int *)malloc((size_t)(prior + np + gen + 8) * sizeof(int));
+    int *outtok = (int *)malloc((size_t)(gen + 8) * sizeof(int));
+    if (!seq || !outtok) { fprintf(stderr, "OOM allocating sequence buffers\n"); return 1; }
+    /* On a resume the saved history occupies the front of the sequence and the prompt
+     * given now is its continuation; the restore below fills seq[0..prior). */
+    memcpy(seq + prior, prompt, (size_t)np * sizeof(int));
+    int T = prior + np;
+    int nout = 0;
+
+    /* ---- optional incremental decode ----
+     * Full recompute re-runs the whole prefix every step, so expert traffic grows with
+     * context: measured 99.7 -> 126.0 GB across just three tokens. Incremental prefills
+     * once and then feeds ONE token per step, carrying the KDA recurrent state (which
+     * k3_kda_layer already updates in place) and an MLA KV cache. Validated by GATE 3
+     * of the tiny-model oracle, which requires the SAME tokens as full recompute. */
+    if (incremental) {
+        w.mla_slot = (int *)malloc((size_t)NL * sizeof(int));
+        if (!w.mla_slot) return 1;
+        w.n_mla = 0;
+        for (int L = 0; L < NL; L++)
+            w.mla_slot[L] = k3_is_mla(&c, L) ? w.n_mla++ : -1;
+        w.kv_cap = Tmax;
+        const size_t kvper = (size_t)w.kv_cap * c.n_heads * (c.qk_nope + c.v_head);
+        const size_t rpper = (size_t)w.kv_cap * c.qk_rope;
+        const double kvb = (double)(kvper + rpper) * w.n_mla * sizeof(float);
+        human(kvb, b1, sizeof b1);
+        printf("incremental decode: KV cache %s for %d MLA layers at %d positions\n\n",
+               b1, w.n_mla, w.kv_cap);
+        w.kvc   = (float *)calloc(kvper * (size_t)w.n_mla, sizeof(float));
+        w.ropec = (float *)calloc(rpper * (size_t)w.n_mla, sizeof(float));
+        if (!w.kvc || !w.ropec) { fprintf(stderr, "KV cache allocation failed\n"); return 1; }
+        memset(ks, 0, kper * (size_t)NL * sizeof(float));
+        w.cached = 0;
+
+        if (load_state) {
+            const double tl = now_s();
+            if (k3_state_load(load_state, &c, &shd, seq, ks, w.kvc, w.ropec,
+                              w.n_bound, w.n_mla, w.kv_cap) != 0)
+                return 1;
+            w.cached = shd.cached;
+            printf("restored %d positions in %.2f s: decode continues without "
+                   "re-reading the prior context\n\n", w.cached, now_s() - tl);
+        }
+    }
+
+    if (chat) {
+        /* The record of what the carried state was built from. Sized with the KV cache
+         * and grown with it; if it cannot be allocated every turn simply re-prefills. */
+        K3Prefix pf; memset(&pf, 0, sizeof pf);
+        if (incremental && !k3_prefix_alloc(&pf, Tmax))
+            fprintf(stderr, "chat: no memory for the prefix record; every turn will re-prefill\n");
+        const int rc = chat_run(&tok, &chat_template, &chat_history, &chat_opts, history_path,
+                                &prompt, np, gen, incremental, greedy, temperature,
+                                top_p, top_k, seed, &w, &c, &cache, NL, &Tmax, &h, &br, ks,
+                                &sc, lg, &seq, outtok, maxb, kper, &pf);
+        k3_prefix_free(&pf);
+        free(w.kvc); free(w.ropec); free(w.mla_slot);
+        if (w.trunk) k3_trunk_close(w.trunk);
+        k3_cache_free(&cache);
+        for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
+        free(w.lay); k3_bind_model_free(&w.mb); k3_st_close(&st);
+        free(h); free(br); free(ks); free(sc); free(lg); free(seq); free(outtok);
+        free(prompt); k3_chat_history_free(&chat_history);
+        if (k3_expert_drops) {
+            fprintf(stderr, "chat invalid: %ld routed expert load(s) failed; the transcript was preserved\n", k3_expert_drops);
+            return 4;
+        }
+        return rc;
+    }
+
+    /* --spec needs a snapshot of the carried KDA/ShortConv state to roll back a
+     * partially-rejected draft batch: the recurrent state is updated in place and is
+     * not positional, so the only sound recovery is restore-and-replay the accepted
+     * prefix. The snapshot is one memcpy; the replay is one short batched sweep. */
+    const size_t kperP  = (size_t)c.kda_heads * c.kda_head_dim;
+    const size_t kper_f = kperP * c.kda_head_dim + 3 * kperP * (c.conv_k - 1);
+    float *spec_snap = NULL;
+    if (spec_n > 0) {
+        if (!incremental) {
+            fprintf(stderr, "--spec needs --incremental; ignoring --spec\n");
+            spec_n = 0;
+        } else {
+            if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
+            spec_snap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
+            if (!spec_snap) { fprintf(stderr, "OOM for the --spec snapshot\n"); return 1; }
+            printf("speculative decode: up to %d drafted tokens per sweep, n-gram lookup, "
+                   "verified batched\n\n", spec_n);
+        }
+    }
+
+    /* ---- hybrid decode: a second, typically quantized, trunk drafts ----
+     * The draft model shares everything that is identical between the two models: the
+     * embedding, the lm_head, the layer map, and the routed experts (the qdq derivation
+     * touches only 2D trunk tensors). It differs ONLY in trunk weights, so it needs its
+     * own trunk stream, its own layer bindings, and its own recurrent/KV state. Output
+     * exactness is structural: drafts feed the SAME batched greedy verification as
+     * --spec, so what gets emitted is precisely what the exact model would have chosen.
+     * Measured teacher-forced agreement of an int8-derived draft on the released
+     * checkpoint is 94.2 percent against a 96.2 percent measurement ceiling, which is
+     * what makes the draft worth consulting at all. */
+    static K3Trunk trunk_d;
+    Weights dw; memset(&dw, 0, sizeof dw);
+    float *dks = NULL, *dsnap = NULL;
+    long hyb_rounds = 0, hyb_drafted = 0, hyb_accepted = 0;
+    if (draft_dir) {
+        if (!incremental || !trunk_dir) {
+            fprintf(stderr, "--draft-trunk needs --incremental and --trunk; ignoring\n");
+            draft_dir = NULL;
+        } else {
+            if (spec_n <= 0) spec_n = 4;
+            if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
+            if (!spec_snap) {
+                spec_snap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
+                if (!spec_snap) { fprintf(stderr, "OOM for the --spec snapshot\n"); return 1; }
+            }
+            if (k3_trunk_open(&trunk_d, draft_dir, &c, (int64_t)(draft_gb * 1e9),
+                              trunk_ring) != 0)
+                return 1;
+            dw.lay = (K3LayerBind *)calloc((size_t)NL, sizeof(K3LayerBind));
+            dks   = (float *)calloc(kper_f * (size_t)w.n_bound, sizeof(float));
+            dsnap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
+            const size_t kvperd = (size_t)w.kv_cap * c.n_heads * (c.qk_nope + c.v_head);
+            const size_t rpperd = (size_t)w.kv_cap * c.qk_rope;
+            dw.kvc   = (float *)calloc(kvperd * (size_t)w.n_mla, sizeof(float));
+            dw.ropec = (float *)calloc(rpperd * (size_t)w.n_mla, sizeof(float));
+            if (!dw.lay || !dks || !dsnap || !dw.kvc || !dw.ropec) {
+                fprintf(stderr, "OOM for the draft model state\n"); return 1;
+            }
+            dw.mb = w.mb;              /* embed + lm_head are the same tensors */
+            dw.trunk = &trunk_d;
+            dw.n_bound = w.n_bound;
+            dw.mla_slot = w.mla_slot;  /* read-only map, safely shared */
+            dw.n_mla = w.n_mla;
+            dw.kv_cap = w.kv_cap;
+            dw.cached = 0;
+            dw.draft_mode = 1;   /* cache-only routing: draft tokens read no new experts */
+            printf("hybrid decode: draft trunk %s (%.1f GB budget) proposes up to %d "
+                   "tokens per sweep;\n               the exact model verifies every one "
+                   "before it is emitted\n\n", draft_dir, draft_gb, spec_n);
+        }
+    }
+
+    /* --tf-check: teacher-forced agreement over the whole --ids sequence in ONE sweep.
+     * Prediction i is the argmax after positions 0..i; it is compared to the id the
+     * sequence actually continues with. This is the acceptance rate a draft model
+     * would see under batched greedy verification, measured directly, and it is the
+     * one number a quantized-draft design stands on. Free-running comparisons cannot
+     * measure it: a single early divergence changes every later context. */
+    if (tf_check) {
+        if (np < 2) { fprintf(stderr, "--tf-check needs at least 2 ids\n"); return 2; }
+        int *arg = (int *)malloc((size_t)np * sizeof(int));
+        if (!arg) { fprintf(stderr, "OOM for --tf-check\n"); return 1; }
+        const double t0c = now_s();
+        if (forward(&w, &c, &cache, seq, np, lg, sc, h, br, ks, arg) != 0) {
+            fprintf(stderr, "forward failed in --tf-check\n");
+            return 1;
+        }
+        int match = 0;
+        for (int i = 0; i + 1 < np; i++) match += (arg[i] == seq[i + 1]);
+        printf("teacher-forced agreement: %d/%d positions (%.1f%%) in %.1f s\n",
+               match, np - 1, 100.0 * match / (np - 1), now_s() - t0c);
+        printf("  per-position (p=predicted a=actual): ");
+        for (int i = 0; i + 1 < np; i++)
+            if (arg[i] != seq[i + 1])
+                printf("[%d p=%d a=%d] ", i, arg[i], seq[i + 1]);
+        printf("\n");
+        FILE *tf = fopen(outp, "w");
+        if (tf) {
+            fprintf(tf, "{\"tf_positions\":%d,\"tf_matches\":%d,\"tf_agreement\":%.4f}\n",
+                    np - 1, match, (double)match / (np - 1));
+            fclose(tf);
+        }
+        free(arg);
+        return 0;
+    }
+
+    printf("%-6s %-10s %-12s %-10s %-10s %s\n",
+           "STEP", "TOKEN", "SECONDS", "CACHE HIT", "READ GB", "TOK/S");
+    printf("--------------------------------------------------------------------\n");
+    k3_expert_drops = 0;
+    double t_total = 0.0;
+    /* Per-step cache statistics are reset each iteration so the columns below describe
+     * that step alone. The end-of-run summary needs whole-run totals, so accumulate the
+     * expert side here; the trunk side is already cumulative. Comparing a cumulative
+     * figure against a single step would misstate the I/O share. */
+    double expert_s_total = 0.0, expert_gb_total = 0.0;
+    uint64_t expert_reqs_total = 0, expert_evict_total = 0, expert_bytes_total = 0;
+    /* From here on the first Ctrl-C is a request to stop at the next safe point, not a
+     * kill: the step in flight completes, then --save-state, --out and the reports run
+     * exactly as for a finished run, and the exit code is 5. Armed only now, so a
+     * Ctrl-C during the minutes of weight loading above still kills at once. */
+    k3_cancel_install();
+    int interrupted = 0;
+    /* `nout < gen` drives generation; the `g == 0` disjunct additionally runs the
+     * incremental prefill once even when --gen 0, so the prompt's KV and recurrent
+     * state are computed and can be saved with ZERO generated tokens. That is what
+     * lets --gen 0 --save-state warm a reusable prefix (e.g. a chat system prompt)
+     * whose recurrent state is exact rather than one generated token past the end. */
+    for (int g = 0; nout < gen || (incremental && g == 0); g++) {
+        if (k3_cancel_requested()) {
+            /* Checked at the top, so the step that was in flight when the signal
+             * arrived has finished and its KV rows and recurrent state are exact. */
+            interrupted = 1;
+            printf("interrupted: %d of %d tokens generated; state, results and reports "
+                   "follow as for a finished run\n", nout, gen);
+            break;
+        }
+        k3_cache_reset_stats(&cache);
+        const double ts = now_s();
+        int frc;
+        int emit[K3_SPEC_MAX + 1];
+        int emitn = 0;
+        if (incremental && g == 0) {
+            /* Step 0 feeds everything not yet consumed: the whole prompt on a fresh
+             * run, and on a resume the carried pending token PLUS the new prompt.
+             * T - base covers both exactly; feeding np here instead dropped the last
+             * new token from a resumed batch, and the first generated token then came
+             * from a context one token short: fluent, plausible, and wrong. */
+            const int base = w.cached;
+            const int nT0 = T - base;
+            frc = forward(&w, &c, &cache, seq + base, nT0, lg, sc, h, br, ks, NULL);
+            if (frc == 0) { w.cached = base + nT0; emit[emitn++] = argmax_(lg, c.vocab); }
+            /* The draft model must absorb the same context, or its first proposals
+             * come from a shorter one; one draft sweep, paid once. Saved state does
+             * not include the draft's, so a resumed run replays the WHOLE sequence
+             * through the draft once; correctness never depends on this, only
+             * acceptance does. */
+            if (dw.trunk && frc == 0) {
+                const int db = load_state ? 0 : base;
+                if (forward(&dw, &c, &cache, seq + db, base + nT0 - db, lg, sc, h, br,
+                            dks, NULL) == 0)
+                    dw.cached = base + nT0;
+                else frc = -1;
+            }
+        } else if (incremental) {
+            const int base = w.cached;
+            int d[K3_SPEC_MAX], nd = 0;
+            if (spec_snap && T + spec_n + 1 < Tmax && base + spec_n + 1 <= w.kv_cap) {
+                if (dw.trunk) {
+                    /* The draft model proposes: k sequential one-token steps through
+                     * the draft trunk, chaining its own argmax. Its state is
+                     * snapshotted first so a partial acceptance can rewind it the
+                     * same way the exact side rewinds. */
+                    memcpy(dsnap, dks, kper_f * (size_t)w.n_bound * sizeof(float));
+                    int prev = seq[base];
+                    while (nd < spec_n) {
+                        if (forward(&dw, &c, &cache, &prev, 1, lg, sc, h, br,
+                                    dks, NULL) != 0) break;
+                        dw.cached += 1;
+                        prev = argmax_(lg, c.vocab);
+                        d[nd++] = prev;
+                    }
+                    hyb_rounds  += 1;
+                    hyb_drafted += nd;
+                } else {
+                    nd = spec_draft(seq, T, spec_n, d);
+                }
+            }
+            if (nd > 0) {
+                /* One sweep verifies the pending token plus nd drafts. arg[i] is the
+                 * model's own next token after batch position i; the accepted prefix is
+                 * exactly what serial decode would have emitted, and arg[m] after it is
+                 * clean because its context contains only accepted tokens. */
+                int arg[K3_SPEC_MAX + 1];
+                memcpy(spec_snap, ks, kper_f * (size_t)w.n_bound * sizeof(float));
+                for (int i = 0; i < nd; i++) seq[T + i] = d[i];
+                frc = forward(&w, &c, &cache, seq + base, nd + 1, lg, sc, h, br, ks, arg);
+                if (frc == 0) {
+                    int m = 0;
+                    while (m < nd && arg[m] == d[m]) m++;
+                    if (m == nd) {
+                        /* every fed position had true context; state is exact */
+                        w.cached = base + nd + 1;
+                    } else {
+                        /* the recurrent state absorbed rejected tokens: restore, then
+                         * replay only the accepted prefix. The replay also rewrites the
+                         * KV rows those positions touched, so nothing stale survives. */
+                        memcpy(ks, spec_snap, kper_f * (size_t)w.n_bound * sizeof(float));
+                        w.cached = base;
+                        frc = forward(&w, &c, &cache, seq + base, m + 1, lg, sc, h, br,
+                                      ks, NULL);
+                        if (frc == 0) w.cached = base + m + 1;
+                    }
+                    /* Resync the draft model to the ACCEPTED sequence. On full
+                     * acceptance its state already contains every fed token except
+                     * the last draft, so one step closes the gap; on partial
+                     * acceptance it rewinds to its snapshot and replays only the
+                     * accepted prefix, mirroring the exact side. */
+                    if (dw.trunk && frc == 0) {
+                        hyb_accepted += m;
+                        if (m == nd) {
+                            int last = d[nd - 1];
+                            if (forward(&dw, &c, &cache, &last, 1, lg, sc, h, br,
+                                        dks, NULL) == 0) dw.cached += 1;
+                            else frc = -1;
+                        } else {
+                            memcpy(dks, dsnap, kper_f * (size_t)w.n_bound * sizeof(float));
+                            dw.cached = base;
+                            if (forward(&dw, &c, &cache, seq + base, m + 1, lg, sc,
+                                        h, br, dks, NULL) == 0) dw.cached = base + m + 1;
+                            else frc = -1;
+                        }
+                    }
+                    if (frc == 0) {
+                        for (int i = 0; i < m; i++) emit[emitn++] = d[i];
+                        emit[emitn++] = arg[m];
+                    }
+                }
+            } else {
+                frc = forward(&w, &c, &cache, seq + base, 1, lg, sc, h, br, ks, NULL);
+                if (frc == 0) { w.cached = base + 1; emit[emitn++] = argmax_(lg, c.vocab); }
+                /* keep the draft in lockstep through non-drafted steps */
+                if (dw.trunk && frc == 0) {
+                    if (forward(&dw, &c, &cache, seq + base, 1, lg, sc, h, br,
+                                dks, NULL) == 0) dw.cached = base + 1;
+                    else frc = -1;
+                }
+            }
+        } else {
+            frc = forward(&w, &c, &cache, seq, T, lg, sc, h, br, ks, NULL);
+            if (frc == 0) emit[emitn++] = argmax_(lg, c.vocab);
+        }
+        /* Abort the run rather than argmax a buffer the forward never wrote. */
+        if (frc != 0 || emitn == 0) {
+            fprintf(stderr, "forward pass failed at generation step %d; aborting.\n", g);
+            return 1;
+        }
+        const int nxt = emit[emitn - 1];
+        /* Dump the FIRST step's logits as raw float32 bits.
+         * Comparing generated tokens against a reference only compares argmax, which
+         * hides near-ties: two engines can agree on every token while disagreeing
+         * substantially on the logit vector behind it. tools/ref_forward.py produces the
+         * same vector from the same shards in torch, and tools/cmp_logits.py compares
+         * them elementwise. That is the only check here that can see a small systematic
+         * error in the final norm, the lm_head, or the model-level AttnRes. */
+        if (logits_path && g == 0) {
+            FILE *lf = fopen(logits_path, "wb");
+            if (lf) {
+                fwrite(lg, sizeof(float), (size_t)c.vocab, lf);
+                fclose(lf);
+                printf("wrote %s (%d float32 logits)\n", logits_path, c.vocab);
+            } else {
+                fprintf(stderr, "cannot open %s for the logits dump\n", logits_path);
+            }
+        }
+        const double dt = now_s() - ts;
+        t_total += dt;
+        const uint64_t req = cache.hits + cache.misses;
+        printf("%-6d %-10d %-12.2f %-10.1f %-10.2f %.3f\n", g, nxt, dt,
+               req ? 100.0 * cache.hits / req : 0.0,
+               (double)cache.bytes_read / 1e9, 1.0 / dt);
+        fflush(stdout);
+        /* Roll the per-step figures up before the next reset wipes them. */
+        expert_s_total     += cache.load_seconds;
+        expert_gb_total    += (double)cache.bytes_read / 1e9;
+        expert_bytes_total += cache.bytes_read;
+        expert_reqs_total  += cache.hits + cache.misses;
+        expert_evict_total += cache.evictions;
+        for (int i = 0; i < emitn && nout < gen && T < Tmax; i++) {
+            seq[T++] = emit[i];
+            outtok[nout++] = emit[i];
+            /* Checked here rather than per step so a speculative sweep that verifies
+             * past a stop id is truncated at the stop, exactly like serial decode. */
+            for (int s = 0; s < n_stop; s++)
+                if (emit[i] == stop_id[s]) { hit_stop = 1; stopped_at = emit[i]; break; }
+            if (hit_stop) break;
+        }
+        if (hit_stop) {
+            printf("stop id %d reached after %d of %d tokens\n", stopped_at, nout, gen);
+            break;
+        }
+        if (T >= Tmax) break;
+    }
+    if (save_state) {
+        if (!incremental) {
+            fprintf(stderr, "--save-state needs --incremental; nothing written\n");
+        } else {
+            const double tsv = now_s();
+            const int64_t kvpp   = (int64_t)c.n_heads * (c.qk_nope + c.v_head);
+            const int64_t ropepp = (int64_t)c.qk_rope;
+            if (k3_state_save(save_state, &c, seq, T, ks, w.kvc, w.ropec,
+                              w.n_bound, w.n_mla, w.kv_cap, w.cached,
+                              (int64_t)kper, kvpp, ropepp) == 0) {
+                const double bytes = (double)sizeof(K3StateHdr) + (double)T * sizeof(int)
+                    + (double)kper * w.n_bound * sizeof(float)
+                    + (double)w.cached * (kvpp + ropepp) * w.n_mla * sizeof(float);
+                char sb[32]; human(bytes, sb, sizeof sb);
+                printf("wrote %s (%s, %d positions) in %.2f s\n",
+                       save_state, sb, w.cached, now_s() - tsv);
+            }
+        }
+    }
+
+    if (dw.trunk && hyb_rounds > 0) {
+        printf("\nhybrid decode: %ld rounds, %ld drafted, %ld accepted (%.1f%%), "
+               "mean accepted run %.2f\n",
+               hyb_rounds, hyb_drafted, hyb_accepted,
+               hyb_drafted ? 100.0 * hyb_accepted / hyb_drafted : 0.0,
+               (double)hyb_accepted / hyb_rounds);
+        k3_trunk_close(&trunk_d);
+        free(dw.lay); free(dks); free(dsnap); free(dw.kvc); free(dw.ropec);
+    }
+    free(spec_snap);
+    printf("--------------------------------------------------------------------\n");
+    if (nout > 0)
+        printf("%d tokens in %.1f s, %.2f s/token average\n",
+               nout, t_total, t_total / nout);
+    else
+        printf("prefill only: %d positions cached, 0 tokens generated\n", w.cached);
+
+    /* Decoded text, when a tokenizer is loaded. Printed as a distinct block rather than
+     * streamed per token: a partially-decoded multi-byte sequence is not valid UTF-8, so
+     * streaming would emit mojibake at every token boundary that splits a codepoint. */
+    char *generated_text = NULL;
+    if (have_tok && nout > 0) {
+        generated_text = (char *)malloc((size_t)nout * 8 + 1);
+        if (generated_text) {
+            int m = tok_decode(&tok, outtok, nout, generated_text, nout * 8);
+            generated_text[m] = 0;
+            printf("\n--- generated text ---\n%s\n----------------------\n\n",
+                   generated_text);
+        }
+    }
+    const double peak_b = peak_rss_bytes();
+    {
+        char rb[32];
+        human(peak_b, rb, sizeof rb);
+        printf("PEAK RSS for the whole run: %s   <- quote this, not the plan\n", rb);
+        printf("layers completed: %d/%d; routed expert drops: %ld\n\n",
+               w.layers_completed, NL, k3_expert_drops);
+    }
+    k3_cache_report(&cache, "final step");
+
+    FILE *f = fopen(outp, "w");
+    if (!f) {
+        fprintf(stderr, "cannot write %s\n", outp);
+        out_fail = 1;
+    }
+    if (f) {
+        fprintf(f, "{\"prompt_ids\":[");
+        for (int i = 0; i < np; i++) fprintf(f, "%s%d", i ? "," : "", prompt[i]);
+        fprintf(f, "],\"generated_ids\":[");
+        for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
+        fprintf(f, "],\"full_ids\":[");
+        for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
+        fprintf(f,
+                "],\"layers\":%d,\"layers_requested\":%d,\"layers_completed\":%d,"
+                "\"expert_drops\":%ld,\"peak_rss_bytes\":%.0f,\"wall_seconds\":%.4f,"
+                "\"seconds_per_token\":%.4f,\"expert_bytes_read\":%llu,"
+                "\"trunk_bytes_read\":%llu,\"embedding_bytes_read\":%llu,"
+                "\"lm_head_bytes_read\":%llu,\"ultra_low_memory\":%s,"
+                "\"stopped_at\":%d,\"interrupted\":%s,"
+                "\"generated_text\":",
+                NL, NL, w.layers_completed, k3_expert_drops, peak_b, t_total,
+                nout ? t_total / nout : 0.0, (unsigned long long)expert_bytes_total,
+                (unsigned long long)(w.trunk ? w.trunk->bytes_read : 0),
+                (unsigned long long)w.ms.embed_bytes_read,
+                (unsigned long long)w.ms.lm_head_bytes_read,
+                w.ultra ? "true" : "false", stopped_at, interrupted ? "true" : "false");
+        json_string(f, generated_text);
+        fputs("}\n", f);
+        fclose(f);
+        printf("\nwrote %s\n", outp);
+    }
+    if (trace_dir) {
+        char p[4096];
+        snprintf(p, sizeof p, "%s/expert_hist.json", trace_dir);
+        k3_cache_dump_hist(&cache, p);
+        snprintf(p, sizeof p, "%s/expert_trace.bin", trace_dir);
+        k3_cache_dump_trace(&cache, p);
+    }
+
+    free(w.kvc); free(w.ropec); free(w.mla_slot);
+    /* Report the compute-versus-I/O split rather than leaving it to be inferred.
+     *
+     * It cannot be inferred safely: a flat curve across a RAM sweep looks like evidence
+     * of a compute-bound engine, but it is equally consistent with the trunk being
+     * streamed in full at every point of the sweep, so that the bytes moved barely
+     * change. Those two have opposite tuning implications, and only a direct measurement
+     * separates them. */
+    {
+        const double trunk_s = w.trunk ? w.trunk->load_seconds : 0.0;
+        const double model_s = w.ultra ? w.ms.read_seconds : 0.0;
+        /* Both terms MUST be whole-run totals over the same window. Mixing a cumulative
+         * trunk time with a last-step expert time and dividing by the whole run
+         * understates the expert share by roughly the token count. */
+        const double io_s = trunk_s + expert_s_total + model_s;
+        const double share = t_total > 0 ? 100.0 * io_s / t_total : 0.0;
+        printf("I/O share of wall clock: %.1f%%  (trunk %.1f s + experts %.1f s + "
+               "model tables %.1f s of %.1f s)\n",
+               share, trunk_s, expert_s_total, model_s, t_total);
+        printf("  both figures are WHOLE-RUN totals over %d steps\n", nout);
+        /* Above 100% is not a bug in the arithmetic: with more than one trunk ring slot
+         * the reader thread does device work while the main thread computes, so the two
+         * terms genuinely overlap and their sum can exceed wall clock. Say so, rather
+         * than printing an impossible percentage with no explanation. */
+        if (share > 100.0)
+            printf("  over 100%% because trunk reads overlap compute on the reader thread;\n"
+                   "  %.1f s of device time was hidden behind arithmetic\n", io_s - t_total);
+        /* Report the DERIVED retention, not the raw hit count. `hits` counts an expert
+         * the batch prefetch pulled off disk microseconds earlier, so it equals the
+         * request count at every cache size and means nothing on its own. An expert that
+         * had to be evicted is one that was not retained, so retained = requests -
+         * evictions. The raw hit count is deliberately not printed beside this
+         * percentage: "35328 of 35328 requests hit ... 2.09%% retained" reads as a
+         * contradiction even though both numbers are correct. */
+        const unsigned long long retained =
+            (expert_reqs_total > expert_evict_total)
+                ? (unsigned long long)(expert_reqs_total - expert_evict_total) : 0ULL;
+        printf("  experts, whole run: %.2f GB read | %llu of %llu requests retained in RAM"
+               " (%.2f%%) | %llu evictions\n"
+               "    (retention = requests - evictions; the raw `hits` counter includes\n"
+               "     experts the prefetcher had just read from disk, so it is not a\n"
+               "     measure of avoided I/O)\n\n",
+               expert_gb_total, retained,
+               (unsigned long long)expert_reqs_total,
+               expert_reqs_total ? 100.0 * (double)retained / (double)expert_reqs_total : 0.0,
+               (unsigned long long)expert_evict_total);
+    }
+    if (w.trunk) { k3_trunk_report(w.trunk, "final"); k3_trunk_close(w.trunk); }
+    k3_cache_free(&cache);
+    for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
+    free(w.lay);
+    k3_model_stream_free(&w.ms);
+    k3_bind_model_free(&w.mb);
+    k3_st_close(&st);
+    free(h); free(br); free(ks); free(sc); free(lg); free(generated_text);
+
+    /* A dropped expert means some token was computed with part of its routed sum
+     * missing. The run still produced token ids and they still look plausible, which is
+     * exactly why this has to be an error rather than a note: silent numerical
+     * corruption that exits 0 is indistinguishable from a good run. */
+    if (k3_expert_drops) {
+        fprintf(stderr,
+                "\nRUN INVALID: %ld routed expert load(s) failed and were dropped from\n"
+                "the MoE sum. The token ids above are CORRUPT. Re-run; if this repeats,\n"
+                "the shard set or the storage is at fault.\n", k3_expert_drops);
+        return 4;
+    }
+    if (out_fail) return 3;
+    /* Everything above ran, so the state and results on disk are complete; the code
+     * says the token list is shorter than asked for. */
+    if (interrupted) return 5;
+    return 0;
+}
