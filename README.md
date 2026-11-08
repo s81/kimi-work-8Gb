@@ -256,19 +256,26 @@ negated floating-point comparisons with NaN (`!(x > 0.0)` behaves as `x <= 0.0`)
 breaks the engine's NaN guards, and the test suite catches it.
 
 **Speed.** TCC does almost no optimisation and has no SIMD, so the kernels run the
-scalar paths at roughly a fourteenth of the old GCC `-O3 -march=native` AVX2 build's
-speed. Measured on a 4-core Xeon, three runs each, at real Kimi K3 dimensions:
+scalar paths, written in the shape TCC compiles well (named accumulators, no per-element
+library calls, table-driven widening; see "TCC-shaped dot products" in
+[`src/core/k3_ops.c`](src/core/k3_ops.c)). Kernel benchmark (`tcc -run build.c bench`) on
+a 4-core Xeon at real Kimi K3 dimensions, three runs each:
 
-| kernel | GCC AVX2 (previous build) | TCC (this build) |
-|---|---|---|
-| bf16 matmul 12288 x 7168 | 10.15 / 10.05 / 10.82 ms | 148.4 / 165.7 / 127.9 ms |
-| MXFP4 matmul 3072 x 3584 | 1.29 / 0.81 / 1.31 ms | 17.32 / 19.27 / 16.81 ms |
+| kernel | GCC AVX2 (previous build) | TCC, v1.2.0 kernels | TCC, current kernels |
+|---|---|---|---|
+| bf16 matmul 12288 x 7168 | 10.15 / 10.05 / 10.82 ms | 200.9 / 164.4 / 170.9 ms | 43.8 / 33.1 / 31.2 ms |
+| MXFP4 matmul 3072 x 3584 | 1.29 / 0.81 / 1.31 ms | 29.6 / 28.5 / 22.6 ms | 5.06 / 5.90 / 4.73 ms |
 
-The **results are bit-identical**: both builds print the same output digests, because the
-scalar and AVX2 kernels share one summation order by design. The thread pool
+The two TCC columns were measured back to back in one session; the GCC column is from an
+earlier session on the same machine, whose timings vary by tens of percent between
+sessions. The current kernels are about 5x faster than v1.2.0's, which leaves TCC roughly
+3-4x behind GCC AVX2 on bf16 and 4-5x on MXFP4.
+
+The **results are bit-identical** across all three columns: every build prints the same
+output digests, because the scalar and AVX2 kernels share one summation order by design. The thread pool
 ([`src/core/k3_par.h`](src/core/k3_par.h)) replaces OpenMP and scales 3.6-3.9x on those 4
 cores. The measured time-per-token figures elsewhere in this README come from the GCC build
-and are not what this build achieves; compute-bound runs are slower by about the ratio
+and are not what this build achieves; compute-bound runs are slower by about the ratios
 above.
 
 The tokenizer and config reader are portable C99 and build anywhere. Without a checkpoint

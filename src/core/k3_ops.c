@@ -243,12 +243,54 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     free(uheap);                                  /* free(NULL) is a no-op */
 }
 
+/* ---------------------------------------------- TCC-shaped dot products ---- */
+/* The build compiler is TCC, which does not inline, does not keep values in registers
+ * across statements and does not unroll. The 16-accumulator dot products below are
+ * therefore written the way TCC compiles well, without changing the arithmetic:
+ *
+ *   - SIXTEEN NAMED LOCALS, not double a[16]: element i still lands in accumulator
+ *     i%16 and the reduction is still (a0+a4)+(a8+a12) ... (b0+b1)+(b2+b3), so the
+ *     result is bit-identical to the array form and to the AVX2/NEON paths. Named
+ *     locals avoid an index computation per element.
+ *   - MULTIPLY THEN ADD, not fma(). With TCC, fma() is a call into the C library per
+ *     element. Every product here is exact in double (float x float needs 48 mantissa
+ *     bits, bf16 or E2M1 x float fewer, double has 53), so rounding it is a no-op and
+ *     a*b + c equals fma(a, b, c) bit for bit. Only use this where that holds.
+ *   - ACTIVATIONS WIDENED ONCE per call into a shared double copy (xd), as
+ *     k3_matmul_mxfp4 already did, instead of once per row per element. Float to
+ *     double is exact, so the values are the same.
+ *   - bf16 WIDENED BY TABLE: 65536 doubles (512 KB), each the exact value of one bf16
+ *     pattern, so the hot loop does one load instead of a call, a shift and two
+ *     conversions. The table holds what (double)k3_bf16f(h) returns, NaNs included.
+ * Measured with TCC on one core at 12288 x 7168: the bf16 row loop went from 494 ms to
+ * 83 ms with identical output. */
+#define K3_ACC16 double a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0, \
+                        a8 = 0, a9 = 0, a10 = 0, a11 = 0, a12 = 0, a13 = 0, a14 = 0, a15 = 0
+#define K3_RED16(acc) do { \
+        const double b0_ = (a0 + a4) + (a8  + a12); \
+        const double b1_ = (a1 + a5) + (a9  + a13); \
+        const double b2_ = (a2 + a6) + (a10 + a14); \
+        const double b3_ = (a3 + a7) + (a11 + a15); \
+        (acc) = (b0_ + b1_) + (b2_ + b3_); \
+    } while (0)
+#define K3_X16(M) M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7) \
+                  M(8) M(9) M(10) M(11) M(12) M(13) M(14) M(15)
+
+/* Widened copy of x, or NULL if the allocation fails (callers then widen in place). */
+static double *k3_widen(const float *x, int n)
+{
+    double *xd = (double *)malloc((size_t)n * sizeof(double));
+    if (xd) for (int i = 0; i < n; i++) xd[i] = (double)x[i];
+    return xd;
+}
+
 /* Body of the parallel loop in the function below, over o in [k3_b_, k3_e_). */
 typedef struct {
     float * y;
     const float * x;
     const float * W;
     int in;
+    const double * xd;
 } k3_matmul_rows_ctx;
 static void k3_matmul_rows(void *k3_vctx_, int k3_b_, int k3_e_)
 {
@@ -257,29 +299,30 @@ static void k3_matmul_rows(void *k3_vctx_, int k3_b_, int k3_e_)
     const float * x = C->x;
     const float * W = C->W;
     int in = C->in;
-    (void)y;
-    (void)x;
-    (void)W;
-    (void)in;
+    const double *xd = C->xd;
+    const int in16 = in & ~15;
     for (int o = k3_b_; o < k3_e_; o++) {
         const float *row = W + (size_t)o * in;
-        /* Sixteen accumulators, EXPLICITLY fused products. fma() in double is the
-         * same IEEE operation as _mm256_fmadd_pd per lane, so the scalar and vector
-         * paths stay bit-identical while the dependent-add latency chain that made
-         * one accumulator ~10x slower than the machine's floor disappears. The
-         * reduction pairs lanes exactly the way the vector path's (v0+v1)+(v2+v3)
-         * then cross-lane tree does; change one and you must change the other. */
-        double a[16] = {0};
-        int i = 0;
-        for (; i + 15 < in; i += 16)
-            for (int l = 0; l < 16; l++)
-                a[l] = fma((double)row[i + l], (double)x[i + l], a[l]);
-        double b0 = (a[0] + a[4]) + (a[8]  + a[12]);
-        double b1 = (a[1] + a[5]) + (a[9]  + a[13]);
-        double b2 = (a[2] + a[6]) + (a[10] + a[14]);
-        double b3 = (a[3] + a[7]) + (a[11] + a[15]);
-        double acc = (b0 + b1) + (b2 + b3);
-        for (; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
+        /* Sixteen accumulators, element i in accumulator i%16, reduced by K3_RED16:
+         * the order the AVX2 path's (v0+v1)+(v2+v3) then cross-lane tree reproduces;
+         * change one and you must change the other. Products are float x float, exact
+         * in double, so multiply-then-add equals the fused form (see K3_ACC16). */
+        K3_ACC16;
+        double acc;
+        const float *r = row, *const end = row + in16;
+        if (xd) {
+            const double *p = xd;
+#define K3_MM_D(k) a##k += (double)r[k] * p[k];
+            for (; r < end; r += 16, p += 16) { K3_X16(K3_MM_D) }
+#undef K3_MM_D
+        } else {
+            const float *p = x;
+#define K3_MM_F(k) a##k += (double)r[k] * (double)p[k];
+            for (; r < end; r += 16, p += 16) { K3_X16(K3_MM_F) }
+#undef K3_MM_F
+        }
+        K3_RED16(acc);
+        for (int i = in16; i < in; i++) acc += (double)row[i] * (double)x[i];
         y[o] = (float)acc;
     }
 }
@@ -307,8 +350,10 @@ static void k3_matmul_rows(void *k3_vctx_, int k3_b_, int k3_e_)
 void k3_matmul(float *y, const float *x, const float *W, int in, int out)
 {
     {
-        k3_matmul_rows_ctx k3_ctx_ = { .y = y, .x = x, .W = W, .in = in };
+        double *xd = k3_widen(x, in);             /* NULL: rows widen in place */
+        k3_matmul_rows_ctx k3_ctx_ = { .y = y, .x = x, .W = W, .in = in, .xd = xd };
         k3_par_for(out, 64, k3_matmul_rows, &k3_ctx_);
+        free(xd);
     }
 }
 
@@ -1178,7 +1223,20 @@ typedef struct {
     const float * x;
     const uint16_t * W;
     int in;
+    const double * xd;
 } k3_bf16_rows_ctx;
+
+#if !defined(__AVX2__) && !(defined(__ARM_NEON) && defined(__aarch64__))
+/* Exact double value of every bf16 pattern; see "TCC-shaped dot products". */
+static double K3_BF16_D[65536];
+static int    k3_bf16d_ready = 0;
+
+static void k3_bf16d_init(void)
+{
+    for (int h = 0; h < 65536; h++) K3_BF16_D[h] = (double)k3_bf16f((uint16_t)h);
+    k3_bf16d_ready = 1;
+}
+#endif
 static void k3_bf16_rows(void *k3_vctx_, int k3_b_, int k3_e_)
 {
     const k3_bf16_rows_ctx *C = (const k3_bf16_rows_ctx *)k3_vctx_;
@@ -1186,10 +1244,8 @@ static void k3_bf16_rows(void *k3_vctx_, int k3_b_, int k3_e_)
     const float * x = C->x;
     const uint16_t * W = C->W;
     int in = C->in;
-    (void)y;
-    (void)x;
-    (void)W;
-    (void)in;
+    const double *xd = C->xd;
+    (void)xd;
     for (int o = k3_b_; o < k3_e_; o++) {
         const uint16_t *row = W + (size_t)o * in;
         int i = 0;
@@ -1276,18 +1332,28 @@ static void k3_bf16_rows(void *k3_vctx_, int k3_b_, int k3_e_)
         }
 #else
         {
-            double a[16] = {0};
-            for (; i + 15 < in; i += 16)
-                for (int l = 0; l < 16; l++)
-                    a[l] = fma((double)k3_bf16f(row[i + l]), (double)x[i + l], a[l]);
-            double b0 = (a[0] + a[4]) + (a[8]  + a[12]);
-            double b1 = (a[1] + a[5]) + (a[9]  + a[13]);
-            double b2 = (a[2] + a[6]) + (a[10] + a[14]);
-            double b3 = (a[3] + a[7]) + (a[11] + a[15]);
-            acc = (b0 + b1) + (b2 + b3);
+            /* Element i in accumulator i%16, K3_RED16 reduction: the partition and
+             * tree of the AVX2/NEON paths and of k3_matmul. bf16 x float is exact in
+             * double, so multiply-then-add equals fma (see K3_ACC16). */
+            const double *T = K3_BF16_D;
+            K3_ACC16;
+            const uint16_t *r = row, *const end = row + (in & ~15);
+            if (xd) {
+                const double *p = xd;
+#define K3_BF_D(k) a##k += T[r[k]] * p[k];
+                for (; r < end; r += 16, p += 16) { K3_X16(K3_BF_D) }
+#undef K3_BF_D
+            } else {
+                const float *p = x;
+#define K3_BF_F(k) a##k += T[r[k]] * (double)p[k];
+                for (; r < end; r += 16, p += 16) { K3_X16(K3_BF_F) }
+#undef K3_BF_F
+            }
+            i = in & ~15;
+            K3_RED16(acc);
         }
 #endif
-        for (; i < in; i++) acc = fma((double)k3_bf16f(row[i]), (double)x[i], acc);
+        for (; i < in; i++) acc += (double)k3_bf16f(row[i]) * (double)x[i];
         y[o] = (float)acc;
     }
 }
@@ -1325,8 +1391,15 @@ static void k3_bf16_rows(void *k3_vctx_, int k3_b_, int k3_e_)
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
     {
-        k3_bf16_rows_ctx k3_ctx_ = { .y = y, .x = x, .W = W, .in = in };
+#if !defined(__AVX2__) && !(defined(__ARM_NEON) && defined(__aarch64__))
+        if (!k3_bf16d_ready) k3_bf16d_init();
+        double *xd = k3_widen(x, in);             /* NULL: rows widen in place */
+#else
+        double *xd = NULL;                        /* the SIMD paths widen in register */
+#endif
+        k3_bf16_rows_ctx k3_ctx_ = { .y = y, .x = x, .W = W, .in = in, .xd = xd };
         k3_par_for(out, 64, k3_bf16_rows, &k3_ctx_);
+        free(xd);
     }
 }
 
@@ -1440,12 +1513,21 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
 #if !defined(__AVX2__)
 static float K3_E2M1_PAIR[256][2];
 static int   k3_pair_ready = 0;
+#if !(defined(__ARM_NEON) && defined(__aarch64__))
+/* The same pairs as exact doubles, for the scalar group loop: one load per element
+ * and no float-to-double conversion in the hot loop (see "TCC-shaped dot products"). */
+static double K3_E2M1_PAIRD[256][2];
+#endif
 
 static void k3_pair_init(void)
 {
     for (int b = 0; b < 256; b++) {
         K3_E2M1_PAIR[b][0] = K3_E2M1[b & 0x0F];   /* low nibble  = EVEN element */
         K3_E2M1_PAIR[b][1] = K3_E2M1[b >> 4];     /* high nibble = ODD element  */
+#if !(defined(__ARM_NEON) && defined(__aarch64__))
+        K3_E2M1_PAIRD[b][0] = (double)K3_E2M1_PAIR[b][0];
+        K3_E2M1_PAIRD[b][1] = (double)K3_E2M1_PAIR[b][1];
+#endif
     }
     k3_pair_ready = 1;
 }
@@ -1815,6 +1897,7 @@ static void k3_mxfp4_rows(void *k3_vctx_, int k3_b_, int k3_e_)
             }
 #else
             {
+#if defined(__ARM_NEON) && defined(__aarch64__)
                 /* Expand the group to floats first, then take a plain dot product. The
                  * split exists so the second loop can vectorise, which it cannot do
                  * while a table lookup sits in the middle of the accumulation. */
@@ -1827,7 +1910,6 @@ static void k3_mxfp4_rows(void *k3_vctx_, int k3_b_, int k3_e_)
                 }
                 if (n & 1) wf[n - 1] = K3_E2M1_PAIR[pb[half]][0];
 
-#if defined(__ARM_NEON) && defined(__aarch64__)
                 {
                     /* uk holds the scalar path's {s[2k], s[2k+1]}: element i in
                      * accumulator i%8, vfmaq_f64 the same IEEE fma() per lane. u0+u2 is
@@ -1851,18 +1933,34 @@ static void k3_mxfp4_rows(void *k3_vctx_, int k3_b_, int k3_e_)
                     const float64x2_t t1 = vaddq_f64(u1, u3);
                     sub = vaddvq_f64(t0) + vaddvq_f64(t1);
                 }
+                for (; i < n; i++) sub = fma((double)wf[i], xdg[i], sub);
 #else
                 {
-                    double s[8] = {0};
-                    for (; i + 7 < n; i += 8)
-                        for (int l = 0; l < 8; l++)
-                            s[l] = fma((double)wf[i + l], xdg[i + l], s[l]);
-                    double b0 = s[0] + s[4], b1 = s[1] + s[5];
-                    double b2 = s[2] + s[6], b3 = s[3] + s[7];
+                    /* Decoded straight from the packed bytes, two elements per byte,
+                     * no wf[] round trip. Element i in accumulator i%8, reduced as
+                     * (s0+s4)+(s1+s5) ... (b0+b1)+(b2+b3): the order of the former
+                     * expand-then-dot loop and of the NEON path. E2M1 x float is exact
+                     * in double, so multiply-then-add equals fma (see K3_ACC16). */
+                    double s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0, s7 = 0;
+                    const unsigned char *b = pb;
+                    const double *p = xdg;
+                    for (; i + 7 < n; i += 8, b += 4, p += 8) {
+                        const double *d0 = K3_E2M1_PAIRD[b[0]];
+                        const double *d1 = K3_E2M1_PAIRD[b[1]];
+                        const double *d2 = K3_E2M1_PAIRD[b[2]];
+                        const double *d3 = K3_E2M1_PAIRD[b[3]];
+                        s0 += d0[0] * p[0];  s1 += d0[1] * p[1];
+                        s2 += d1[0] * p[2];  s3 += d1[1] * p[3];
+                        s4 += d2[0] * p[4];  s5 += d2[1] * p[5];
+                        s6 += d3[0] * p[6];  s7 += d3[1] * p[7];
+                    }
+                    const double b0 = s0 + s4, b1 = s1 + s5;
+                    const double b2 = s2 + s6, b3 = s3 + s7;
                     sub = (b0 + b1) + (b2 + b3);
                 }
+                for (; i < n; i++)                /* odd remainder; K3 never has one */
+                    sub += K3_E2M1_PAIRD[pb[i >> 1]][i & 1] * xdg[i];
 #endif
-                for (; i < n; i++) sub = fma((double)wf[i], xdg[i], sub);
             }
 #endif
             acc += sub * (double)K3_E8M0[sb];

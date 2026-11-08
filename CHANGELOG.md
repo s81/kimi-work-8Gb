@@ -5,6 +5,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Performance
+
+- **Matmul kernels about 5x faster under TCC**, output bit-identical. The scalar
+  bf16, fp32 and MXFP4 dot products are reshaped for how TCC compiles: sixteen (eight for
+  MXFP4) named accumulators instead of an indexed array, multiply-then-add instead of a
+  libm `fma()` call per element (every product is exact in double, so the result is the
+  same bit for bit), activations widened to double once per call, bf16 widened through a
+  65536-entry double table, and MXFP4 decoded straight from the packed bytes through a
+  byte-to-double-pair table. Kernel benchmark, 4-core Xeon, three runs each, measured
+  back to back: bf16 12288 x 7168 200.9/164.4/170.9 ms to 43.8/33.1/31.2 ms; MXFP4
+  3072 x 3584 29.6/28.5/22.6 ms to 5.06/5.90/4.73 ms. Same output digests;
+  `tcc -run build.c test` and `test_ops` at 1, 3 and 4 threads pass.
+
 ## [1.2.0] - 2026-11-08
 
 Linux and Windows x86-64 release, built with the Tiny C Compiler only. Release notes:
