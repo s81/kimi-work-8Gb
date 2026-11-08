@@ -63,13 +63,21 @@ def exact(fn, xbits):
     return mpmath.exp(x) if fn == "exp" else mpmath.tanh(x)
 
 
+def want_bits(fn, xbits):
+    """The correctly rounded result's bits. tanh keeps the sign of a zero input
+    (tanh(-0) = -0); mpmath has no signed zero, so that case is taken from x."""
+    if fn == "tanh" and xbits & 0x7FFFFFFF == 0:
+        return xbits
+    return round_to_f32(exact(fn, xbits))
+
+
 def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "--emit":
         for tok in sys.argv[2:]:
             fn, xb = tok.split(":")
             xb = int(xb, 16)
             print("    { %-5s 0x%08xu, 0x%08xu },  /* %r */"
-                  % ('"%s",' % fn, xb, round_to_f32(exact(fn, xb)), f32(xb)))
+                  % ('"%s",' % fn, xb, want_bits(fn, xb), f32(xb)))
         return 0
     if len(sys.argv) != 2:
         print(__doc__)
@@ -81,7 +89,7 @@ def main():
             if len(parts) != 3:
                 continue
             fn, xb, got = parts[0], int(parts[1], 16), int(parts[2], 16)
-            want = round_to_f32(exact(fn, xb))
+            want = want_bits(fn, xb)
             n += 1
             if want != got:
                 bad += 1

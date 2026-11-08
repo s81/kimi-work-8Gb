@@ -232,7 +232,7 @@ static float k3_tanhf(float x)
         k3m_two_sum(q0, q1, &s, &e);
         r = k3m_round_odd_to_float(s, e);
     }
-    return x < 0.0f ? -r : r;
+    return (k3m_u((double)x) >> 63) ? -r : r;   /* the sign bit, so tanh(-0) = -0 */
 }
 
 #endif /* K3_MATH_H */
