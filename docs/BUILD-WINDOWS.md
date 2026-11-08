@@ -23,7 +23,7 @@ Windows, so it needs no installer or extra DLLs. Windows Vista or later is requi
 Check a download in PowerShell:
 
 ```powershell
-Get-FileHash .\k3-1.1.0-windows-x64.zip -Algorithm SHA256   # compare with SHA256SUMS.txt
+Get-FileHash .\k3-1.2.0-windows-x64.zip -Algorithm SHA256   # compare with SHA256SUMS.txt
 .\k3.exe --help
 ```
 
