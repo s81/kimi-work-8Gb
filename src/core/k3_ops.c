@@ -104,7 +104,9 @@ void k3_rmsnorm(float *y, const float *x, const float *w, int n, float eps)
 }
 
 /* -------------------------------------------------------------- SiTU-GLU ---- */
-static inline float sigmoidf_(float x) { return 1.0f / (1.0f + k3_expf(-x)); }
+/* A macro, not a function: TCC inlines nothing, and a call per element costs more than
+ * the arithmetic. Same expression, same bits. The argument must not have side effects. */
+#define sigmoidf_(x) (1.0f / (1.0f + k3_expf(-(x))))
 
 /* See k3.h. Incremented whenever a streamed expert cannot be fetched. */
 long k3_expert_drops = 0;
