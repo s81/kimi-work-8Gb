@@ -43,9 +43,28 @@ $Tcc   = Join-Path $Tools 'tinycc\win32\tcc.exe'
 
 function Step($msg) { Write-Host ""; Write-Host "== $msg" }
 
+# curl.exe ships with Windows 10 (1803) and later. It is preferred because repo.or.cz
+# puts a "are you a bot?" web page in front of browser-like clients, and PowerShell's
+# Invoke-WebRequest identifies as one; curl's user agent gets the file. The fallback
+# sends the same kind of user agent.
 function Get-Download($url, $out) {
     Write-Host "   downloading $url"
-    Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if ($curl) {
+        & $curl.Source -fsSL --retry 3 -o $out $url
+        if ($LASTEXITCODE -ne 0) { throw "download failed (curl exit $LASTEXITCODE): $url" }
+    } else {
+        Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -UserAgent 'curl/8.4.0'
+    }
+}
+
+# A zip starts with "PK". Anything else is usually a web page served in its place.
+function Assert-Zip($path, $url) {
+    $fs = [System.IO.File]::OpenRead($path)
+    try { $b0 = $fs.ReadByte(); $b1 = $fs.ReadByte() } finally { $fs.Close() }
+    if ($b0 -ne 0x50 -or $b1 -ne 0x4B) {
+        throw "$url did not return a zip archive (the server probably sent a web page, such as a bot check). Try again later, or build TCC by hand as in docs/BUILD-WINDOWS.md."
+    }
 }
 
 function Get-TreeSha256($dir) {
@@ -74,6 +93,7 @@ if (Test-Path $Tcc) {
     $bootZip = Join-Path $Tools 'tcc-0.9.27-win64-bin.zip'
     $boot    = Join-Path $Tools 'boot'
     Get-Download $BootUrl $bootZip
+    Assert-Zip $bootZip $BootUrl
     $sha = (Get-FileHash -LiteralPath $bootZip -Algorithm SHA256).Hash.ToLower()
     if ($sha -ne $BootSha256) { throw "TCC 0.9.27 download has SHA-256 $sha, expected $BootSha256. Not using it." }
     Write-Host "   SHA-256 ok"
@@ -85,6 +105,7 @@ if (Test-Path $Tcc) {
     $unpack = Join-Path $Tools 'src-unpack'
     $src    = Join-Path $Tools 'tinycc'
     Get-Download $SrcUrl $srcZip
+    Assert-Zip $srcZip $SrcUrl
     if (Test-Path $unpack) { Remove-Item -Recurse -Force $unpack }
     Expand-Archive -LiteralPath $srcZip -DestinationPath $unpack
     $top = @(Get-ChildItem -LiteralPath $unpack -Directory)
