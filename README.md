@@ -301,6 +301,18 @@ cd kimi-work-8Gb
 tcc -run build.c test    # builds everything and runs every weightless test
 ```
 
+**On Windows**, with no compiler installed yet: clone the repository (or download its zip
+from GitHub), then run
+
+```bat
+setup.bat
+```
+
+in a Command Prompt, or double-click it. It downloads and checks the Tiny C Compiler,
+builds it, builds `bin\k3.exe` and runs the same tests, in a few minutes, keeping
+everything inside the repository folder. Details: [docs/BUILD-WINDOWS.md](docs/BUILD-WINDOWS.md).
+If you only want to run k3, the release page has a ready-made Windows zip.
+
 It ends like this, or it failed:
 
 ```
@@ -454,15 +466,15 @@ usage error (exit 2).
 
 | flag | argument | |
 |---|---|---|
-| `--prompt` | `TEXT` | tokenize TEXT and run it. **Requires `--tok`.** |
-| `--prompt-file` | `PATH` | tokenize the file's bytes. **Requires `--tok`.** Preferred for anything non-ASCII: the shell re-encodes `argv`, whereas a file is read verbatim |
+| `--prompt` | `TEXT` | tokenize TEXT and run it. **Requires `--tok`.** Any language works: on Windows `k3.exe` reads its command line as Unicode and converts it to UTF-8; on Linux it arrives as the terminal sends it, UTF-8 in a UTF-8 locale |
+| `--prompt-file` | `PATH` | tokenize the file's bytes exactly. **Requires `--tok`.** The repeatable choice for scripts and benchmarks: no shell or terminal can change a file |
 | `--ids` | `1,2,3` | token ids directly. No tokenizer is loaded at all, so this works on a machine with no tokenizer files. The reproducible channel the tests use |
 
 ```bash
 # text in
 ./bin/k3 ~/k3model --tok ~/k3model --prompt "The capital of France is" ...
 
-# text in, from a file. Use this for CJK, emoji, accents
+# text in, from a file, byte for byte
 printf 'La capitale de la France est' > /tmp/p.txt
 ./bin/k3 ~/k3model --tok ~/k3model --prompt-file /tmp/p.txt ...
 
@@ -709,9 +721,11 @@ Three numbers carry the meaning:
 **Memory sits near 113 GB even at a small preset.** `--trunk` was omitted. Without a packed
 trunk directory the whole trunk is loaded resident; every preset assumes streaming.
 
-**A non-ASCII prompt tokenizes oddly.** The shell re-encodes `argv`, so the engine receives
-different bytes than you typed. Put the prompt in a file and use `--prompt-file`, which is
-read verbatim.
+**A non-ASCII prompt tokenizes oddly.** On Linux, check that the terminal is UTF-8
+(`locale` should show a `UTF-8` charset); a Latin-1 terminal sends different bytes than
+the tokenizer expects. On Windows, `k3.exe` up to v1.2.2 received its command line in the
+ANSI code page, which loses most non-Latin text; later builds read it as Unicode. Either
+way, `--prompt-file` reads the prompt byte for byte and is never affected.
 
 **`--prompt/--prompt-file need --tok DIR`.** The tokenizer ships with the checkpoint, so
 add `--tok ~/k3model`. The engine exits rather than guessing where the vocabulary lives. To

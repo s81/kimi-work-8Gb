@@ -132,6 +132,10 @@ if (Test-Path $Tcc) {
 & $Tcc -v
 if ($LASTEXITCODE -ne 0) { throw "the built tcc.exe does not run" }
 
+# build.c starts the compiler by name; point it at this one, for this process only.
+$env:CC   = $Tcc
+$env:Path = "$(Split-Path -Parent $Tcc);$env:Path"
+
 Push-Location $Root
 try {
     Step "4/4  building k3"

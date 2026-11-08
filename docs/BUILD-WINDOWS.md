@@ -14,6 +14,31 @@ tcc -run build.c dist     :: packages dist\k3-<version>-windows-x64.zip
 Windows, so it needs no installer or extra DLLs. Windows Vista or later is required
 (the engine uses Vista's condition variables).
 
+## One command: setup.bat
+
+From a fresh clone (or the source zip from GitHub), in a Command Prompt or by
+double-clicking:
+
+```bat
+setup.bat              :: toolchain if needed, then build k3 and run the tests
+setup.bat -SkipTests   :: build only
+```
+
+It runs [`scripts/setup-windows.ps1`](../scripts/setup-windows.ps1), which does the steps
+in *Get the right TCC* below by itself:
+
+1. downloads the official TCC 0.9.27 and checks its SHA-256;
+2. downloads TinyCC's source at the pinned commit as a zip (no `git` needed) and checks a
+   SHA-256 over every file in it;
+3. builds TCC 0.9.28rc with TCC 0.9.27;
+4. builds `bin\k3.exe` and runs `tcc -run build.c test`.
+
+Everything goes into `.tcc\` inside the repository (about 30 MB): nothing is installed
+system-wide and `PATH` is not changed. Running it again skips the toolchain. It needs
+Windows 10 or later (PowerShell 5.1, `curl.exe`, TLS 1.2) and, the first time, access to
+`download.savannah.gnu.org` and `repo.or.cz`. CI runs it on a fresh `windows-latest`
+checkout on every push.
+
 ## Download a prebuilt binary
 
 - **Every push and pull request:** the repository's **Actions** tab, workflow **CI**,
@@ -27,9 +52,9 @@ Get-FileHash .\k3-1.2.2-windows-x64.zip -Algorithm SHA256   # compare with SHA25
 .\k3.exe --help
 ```
 
-Running the model needs the Kimi K3 weights, downloaded separately (about 1.56 TB). Pass
-non-ASCII prompts with `--prompt-file`, because Windows re-encodes argv to the active
-code page.
+Running the model needs the Kimi K3 weights, downloaded separately (about 1.56 TB).
+Prompts in any language work with `--prompt`: `k3.exe` reads its command line as Unicode
+(builds up to v1.2.2 did not; use `--prompt-file` with those).
 
 ## Get the right TCC
 
@@ -39,8 +64,8 @@ floating-point comparisons with NaN (`!(x > 0.0)` behaves as `x <= 0.0`), which 
 engine's NaN guards. `tcc -run build.c test` catches it (test_sampler, "NaN temperature is
 rejected").
 
-0.9.27 can build 0.9.28rc, so the toolchain is TCC all the way down. In a Command
-Prompt, with `git` available:
+0.9.27 can build 0.9.28rc, so the toolchain is TCC all the way down. `setup.bat` (above)
+does this for you; by hand, in a Command Prompt with `git` available:
 
 ```bat
 :: 1. the official 0.9.27 release as the bootstrap compiler
@@ -77,7 +102,9 @@ on the include path for Windows builds:
 | Gap | Filled by |
 |---|---|
 | `pthread.h` | `src/compat/win32/pthread.h`: threads, critical sections, Vista condition variables |
-| `unistd.h`, `dirent.h` | small headers in `src/compat/win32/` on msvcrt and `FindFirstFileA` |
+| `unistd.h`, `dirent.h` | small headers in `src/compat/win32/` on msvcrt and `FindFirstFileW` |
+| Unicode command line, console and file names | `k3_win_utf8_main` converts the UTF-16 command line to UTF-8 and switches the console to UTF-8 for the run; chat input is read with `ReadConsoleW`; `fopen`, `open`, `opendir`, `rename`, `unlink`, `mkdir` and `mkstemp` use the wide-character APIs with UTF-8 names. `tests/unit/test_utf8.c` checks all of it |
+| `strtod` in `msvcrt.dll` | it measures the whole remaining string before parsing, so the JSON parser hands it a copy of each number; parsing in place inside a large document was quadratic |
 | 32-bit `off_t`/`lseek` | `_lseeki64`; offsets are held in `int64_t`, never `off_t` (a cast would wrap past 2 GB) |
 | `clock_gettime`, `mkstemp` | `QueryPerformanceCounter`, an exclusive-create loop |
 | `fma`, `expf`, `sqrtf`, `tanhf` | double-precision equivalents; `fma` is exact only because every call site multiplies float-derived values |

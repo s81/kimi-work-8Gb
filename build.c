@@ -506,9 +506,9 @@ static void dist(void)
         "  k3 --help\n"
         "  k3 --list-presets\n\n"
         "Running the model needs the Kimi K3 weights, downloaded separately (about\n"
-        "1.56 TB); see the project README. On Windows, pass non-ASCII prompts with\n"
-        "--prompt-file rather than --prompt: Windows re-encodes argv to the active\n"
-        "code page.\n\n"
+        "1.56 TB); see the project README. Prompts in any language can be passed\n"
+        "with --prompt: on Windows k3 reads its command line as Unicode. For an exact,\n"
+        "repeatable input use --prompt-file, which is read byte for byte.\n\n"
         "Source: https://github.com/s81/kimi-work-8Gb, from\n"
         "https://github.com/FareedKhan-dev/kimi-k3-in-c (Apache-2.0; see LICENSE, NOTICE).\n",
         version, OS_NAME);

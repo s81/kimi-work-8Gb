@@ -5,6 +5,43 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Windows
+
+- **Startup and test time: `strtod` in `msvcrt.dll` made JSON parsing quadratic.** It
+  measures the whole remaining string before parsing one number, and the JSON parser
+  called it in place inside the document. The weightless test suite spent 334 s parsing
+  9 MB of fixtures on `windows-latest` (under a second elsewhere); the same parser reads
+  every safetensors header and the 60 MB model index when a model loads. Numbers are now
+  parsed from a copy of the token: same value on every platform, and the whole Windows
+  CI job went from about 6.5 minutes to well under one.
+- **Thread pool scaling.** `k3_par_for` handed out one block per thread; when waking a
+  worker took longer than the caller's own block, the caller ran the worker's block too
+  and the loop ran serially. On Windows an MXFP4 matmul got 1.1x from 2 threads, from
+  machine code identical to Linux's 1.8x. It now hands out 4 blocks per thread and the
+  Windows build gets 1.9x (measured under Wine on one machine). No result changes.
+- **Prompts and paths in any language.** `k3.exe` now reads its command line as Unicode
+  and converts it to UTF-8, puts the console in UTF-8 for the run (restored at exit),
+  reads typed chat input with `ReadConsoleW`, and opens, lists, renames and deletes files
+  through the wide-character APIs. Before, Windows converted all of these to the ANSI
+  code page and non-Latin text arrived as `?`. `--prompt-file` is no longer needed for
+  non-ASCII prompts. New test: `tests/unit/test_utf8.c`.
+- **`setup.bat`: one command from a fresh clone to a tested `k3.exe`.** It downloads and
+  verifies TCC 0.9.27, downloads the pinned TinyCC source as a zip (no `git`) and
+  verifies every file, builds TCC 0.9.28rc, builds k3 and runs the tests, all inside
+  `.tcc\` in the repository. CI runs it on a fresh `windows-latest` checkout.
+- **Benchmark on both platforms in CI.** `tcc -run build.c bench` now also times the
+  KDA step, SiTU-GLU, ShortConv, KDA decay, rmsnorm, the pool's dispatch and its 1-thread
+  versus all-threads scaling, reports best and median of 7 runs, and runs (without
+  failing the build) on Linux and Windows in CI.
+
+### Known differences on Windows
+
+- SiTU-GLU, ShortConv and the KDA decay call `expf` and `tanhf`. Windows' C library
+  computes them through `exp`/`tanh` in double and gives slightly different results from
+  glibc, so those three kernels are not bit-identical across platforms (the benchmark's
+  digests differ). The matrix kernels, the KDA step and rmsnorm are. Both pass the
+  reference fixtures.
+
 ### Verified
 
 - **Real Kimi K3 weights with the TCC build, Linux.** Using four of the 96 released
