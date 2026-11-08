@@ -86,7 +86,7 @@ on the include path for Windows builds:
 
 ## Speed
 
-TCC builds run the scalar kernels without SIMD and with little optimisation: roughly 3-5x
+TCC builds run the scalar kernels without SIMD and with little optimisation: roughly 2-3x
 slower than the old GCC `-O3` AVX2 build on the compute side, with bit-identical output.
 See the README's *Building* section for the measurements.
 

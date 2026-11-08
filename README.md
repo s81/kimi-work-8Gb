@@ -259,17 +259,18 @@ breaks the engine's NaN guards, and the test suite catches it.
 scalar paths, written in the shape TCC compiles well (named accumulators, no per-element
 library calls, table-driven widening; see "TCC-shaped dot products" in
 [`src/core/k3_ops.c`](src/core/k3_ops.c)). Kernel benchmark (`tcc -run build.c bench`) on
-a 4-core Xeon at real Kimi K3 dimensions, three runs each:
+a 4-core Xeon at real Kimi K3 dimensions, 4 threads:
 
-| kernel | GCC AVX2 (previous build) | TCC, v1.2.0 kernels | TCC, current kernels |
-|---|---|---|---|
-| bf16 matmul 12288 x 7168 | 10.15 / 10.05 / 10.82 ms | 200.9 / 164.4 / 170.9 ms | 43.8 / 33.1 / 31.2 ms |
-| MXFP4 matmul 3072 x 3584 | 1.29 / 0.81 / 1.31 ms | 29.6 / 28.5 / 22.6 ms | 5.06 / 5.90 / 4.73 ms |
+| kernel | GCC AVX2 (previous build) | TCC v1.2.0 | TCC v1.2.1 | TCC, current |
+|---|---|---|---|---|
+| bf16 matmul 12288 x 7168 | 10.15 / 10.05 / 10.82 ms | 200.9 / 164.4 / 170.9 ms | 24.0 ms | 17.5 ms |
+| MXFP4 matmul 3072 x 3584 | 1.29 / 0.81 / 1.31 ms | 29.6 / 28.5 / 22.6 ms | 3.67 ms | 2.85 ms |
 
-The two TCC columns were measured back to back in one session; the GCC column is from an
-earlier session on the same machine, whose timings vary by tens of percent between
-sessions. The current kernels are about 5x faster than v1.2.0's, which leaves TCC roughly
-3-4x behind GCC AVX2 on bf16 and 4-5x on MXFP4.
+Single timings on this machine vary by up to 60% from run to run, so the last two columns
+are the best of 12 runs each, measured back to back; the GCC and v1.2.0 columns are three
+single runs from earlier sessions. Against v1.2.0 the current kernels are about 8-10x
+faster, which leaves TCC roughly 2x behind GCC AVX2 on bf16 and 2-3x on MXFP4. Treat the
+GCC ratio as approximate: it compares best-of-12 against single runs from another session.
 
 The **results are bit-identical** across all three columns: every build prints the same
 output digests, because the scalar and AVX2 kernels share one summation order by design. The thread pool

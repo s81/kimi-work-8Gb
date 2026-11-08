@@ -5,6 +5,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Performance
+
+- **Matmul kernels another 1.3x faster under TCC, KDA recurrence step 2.1x**, output
+  bit-identical. Each accumulator's next additions are written as one chained
+  expression (`a0 = a0 + e0 + e16 + ...`), which TCC keeps in a register instead of
+  storing and reloading per element; C's left-to-right `+` makes it the same sequence of
+  additions as separate `+=` statements. The KDA step walks its rows eight elements at a
+  time and hoists `k[i]*beta` and `v - u`, the same float values the plain loops
+  recomputed. Best of 12 runs, 4-core Xeon, back to back against v1.2.1: bf16 12288 x 7168
+  88.5 to 68.0 ms on one thread, 24.0 to 17.5 ms on four; MXFP4 3072 x 3584 13.2 to
+  10.2 ms and 3.67 to 2.85 ms; KDA step 128 x 128 about 103 to 48 us per call. Checked bit
+  for bit against the v1.2.1 kernels on 206 cases (odd lengths, every MXFP4 group size,
+  NaN, infinity, 1e30, NaN scales, zero keys) besides the test gate and output digests.
+- **Not changed, on purpose:** SiTU-GLU, ShortConv and the KDA decay spend their time in
+  libm `expf`/`tanhf`, which cannot be replaced without changing results. Together with
+  rmsnorm they are about 0.2 s per token on one core, against tens of seconds of matmul.
+
 ## [1.2.1] - 2026-11-08
 
 Linux and Windows x86-64 release with the faster TCC kernels. Release notes:
